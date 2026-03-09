@@ -1,4 +1,5 @@
 # biped-preview-control
+[![Tests](https://github.com/jssilvaa/biped-preview-control/actions/workflows/tests.yml/badge.svg)](https://github.com/jssilvaa/biped-preview-control/actions)
 
 WIP of centroidal preview-control-based humanoid motion generation and stabilization.
 
