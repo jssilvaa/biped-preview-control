@@ -70,14 +70,14 @@ def solve_ik(
     """
     Returns qpos_des computed by damped Gauss-Newton on stacked tasks.
 
-    Tasks:
+    **Tasks**:
       - CoM position
+      - Base/pelvis orientation (optional enforcement)
       - Site position
       - Site orientation
-      - Optional base/pelvis orientation
       - Nominal posture tracking in generalized position coordinates
 
-    Notes:
+    **Notes**:
       - Works in qvel-space increments dq and integrates with mj_integratePos.
       - Rotation errors use log(R_des R^T).
       - Posture task is implemented via mj_differentiatePos to correctly map
@@ -108,9 +108,7 @@ def solve_ik(
         rhs: list[np.ndarray] = []
         W: list[np.ndarray] = []
 
-        # ------------------------------------------------------------------
         # CoM position task
-        # ------------------------------------------------------------------
         com = _com_world(model, data)
         e_com = com_target - com
         J_com = _com_jac(model, data)
@@ -118,9 +116,7 @@ def solve_ik(
         rhs.append(e_com)
         W.append(np.full(3, float(cfg.w_com), dtype=float))
 
-        # ------------------------------------------------------------------
         # Site tasks
-        # ------------------------------------------------------------------
         Jp = np.zeros((3, model.nv), dtype=float)
         Jr = np.zeros((3, model.nv), dtype=float)
 
@@ -143,9 +139,7 @@ def solve_ik(
             rhs.append(e_R)
             W.append(np.full(3, float(cfg.w_site_rot), dtype=float))
 
-        # ------------------------------------------------------------------
         # Optional base/pelvis orientation task
-        # ------------------------------------------------------------------
         if cfg.base_body_id is not None:
             bid = int(cfg.base_body_id)
             if not (0 <= bid < model.nbody):
@@ -161,9 +155,7 @@ def solve_ik(
             rhs.append(e_R_base)
             W.append(np.full(3, float(cfg.w_base_rot), dtype=float))
 
-        # ------------------------------------------------------------------
         # Nominal posture task
-        # ------------------------------------------------------------------
         # Use MuJoCo's differentiatePos to correctly map qpos error -> qvel coords
         # such that applying dq would move current qpos toward qpos_nom.
         e_q = np.zeros(model.nv, dtype=float)
@@ -173,10 +165,8 @@ def solve_ik(
         rhs.append(e_q)
         W.append(np.full(model.nv, float(cfg.w_posture), dtype=float))
 
-        # ------------------------------------------------------------------
         # Weighted damped least squares:
         #   min || sqrt(W) (A dq - b) ||^2 + λ ||dq||^2
-        # ------------------------------------------------------------------
         A = np.vstack(rows)
         b = np.hstack(rhs)
         w = np.hstack(W)

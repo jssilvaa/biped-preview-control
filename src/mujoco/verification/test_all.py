@@ -304,12 +304,20 @@ class TestPreviewLQT:
 
 class TestPreviewCentroidal:
 
+    def _make_cfgs(self, dt=0.005, N=400):
+        from preview_centroidal import PreviewConfig
+        lin_cfg = PreviewConfig(dt=dt, horizon_steps=N, q_pos=2e2, q_wrench=5e-4, r_jerk=1e-8)
+        ang_cfg = PreviewConfig.build_angular(dt=dt, horizon_steps=N)
+        return lin_cfg, ang_cfg
+
     def _make_planner(self, dt=0.005, N=400):
-        from preview_centroidal import CentroidalPreviewPlanner, PreviewConfig
+        from preview_centroidal import CentroidalPreviewPlanner
+        lin_cfg, ang_cfg = self._make_cfgs(dt=dt, N=N)
         return CentroidalPreviewPlanner(
             mass=35.0,
             I_diag=np.array([1.0, 1.0, 0.5]),
-            cfg=PreviewConfig(dt=dt, horizon_steps=N, q_pos=2e2, q_wrench=5e-4, r_jerk=1e-8),
+            lin_cfg=lin_cfg,
+            ang_cfg=ang_cfg,
         )
 
     def test_reset_then_constant_ref_converges(self):
@@ -352,10 +360,10 @@ class TestPreviewCentroidal:
         step_preview with a constant sequence must return the same result
         as step_constant with the corresponding scalar.
         """
-        from preview_centroidal import CentroidalPreviewPlanner, PreviewConfig
-        cfg = PreviewConfig(dt=0.005, horizon_steps=100, q_pos=2e2, q_wrench=5e-4, r_jerk=1e-8)
-        p1 = CentroidalPreviewPlanner(mass=35.0, I_diag=np.ones(3), cfg=cfg)
-        p2 = CentroidalPreviewPlanner(mass=35.0, I_diag=np.ones(3), cfg=cfg)
+        from preview_centroidal import CentroidalPreviewPlanner
+        lin_cfg, ang_cfg = self._make_cfgs(dt=0.005, N=100)
+        p1 = CentroidalPreviewPlanner(mass=35.0, I_diag=np.ones(3), lin_cfg=lin_cfg, ang_cfg=ang_cfg)
+        p2 = CentroidalPreviewPlanner(mass=35.0, I_diag=np.ones(3), lin_cfg=lin_cfg, ang_cfg=ang_cfg)
         com0 = np.array([0.0, 0.0, 1.0])
         p1.reset(com0=com0, comv0=np.zeros(3))
         p2.reset(com0=com0, comv0=np.zeros(3))
@@ -377,14 +385,14 @@ class TestPreviewCentroidal:
         proportionally different bar_moment_world (through the meta field).
         We verify that I_diag=2 gives 2× the bar moment of I_diag=1.
         """
-        from preview_centroidal import CentroidalPreviewPlanner, PreviewConfig, TripleIntegratorAxis
+        from preview_centroidal import CentroidalPreviewPlanner
         # This tests the stack_controller logic that overwrites bar_moment_world,
         # so we verify the meta["phi_acc"] field is consistent.
-        cfg = PreviewConfig(dt=0.005, horizon_steps=100, q_pos=2e2, q_wrench=5e-4, r_jerk=1e-8)
+        lin_cfg, ang_cfg = self._make_cfgs(dt=0.005, N=100)
         I1 = np.array([1.0, 1.0, 1.0])
         I2 = np.array([2.0, 2.0, 2.0])
-        p1 = CentroidalPreviewPlanner(mass=10.0, I_diag=I1, cfg=cfg)
-        p2 = CentroidalPreviewPlanner(mass=10.0, I_diag=I2, cfg=cfg)
+        p1 = CentroidalPreviewPlanner(mass=10.0, I_diag=I1, lin_cfg=lin_cfg, ang_cfg=ang_cfg)
+        p2 = CentroidalPreviewPlanner(mass=10.0, I_diag=I2, lin_cfg=lin_cfg, ang_cfg=ang_cfg)
         p1.reset(com0=np.zeros(3), comv0=np.zeros(3), phi0=np.zeros(3))
         p2.reset(com0=np.zeros(3), comv0=np.zeros(3), phi0=np.zeros(3))
         phi_ref = np.array([0.1, 0.0, 0.0])

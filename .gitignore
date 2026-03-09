@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .pytest_cache/
-.DS_STORE
+*.DS_STORE
 
 # LOGS
 MUJOCO_LOG.TXT
@@ -24,6 +24,8 @@ full.py
 
 # Store backups locally 
 backup/
+*.zip
 
 # plots 
 plots_g1/
+logs.txt

@@ -25,6 +25,7 @@ from wrench_qp_generators import (
 from centroidal_prediction import predict_one_step
 from centroidal_stabilizer import StabilizerGains, stabilize_bar_wrench
 from murooka_wrench import bar_to_contact_wrench_about_origin
+from lie_math import logvec
 
 
 def _body_R_world(data: mujoco.MjData, body_id: int) -> np.ndarray:
@@ -76,8 +77,11 @@ class StackControllerConfig:
   mu: float = 0.6 
   site_vertex_offsets: dict[int, np.ndarray] | None = None 
 
+  sim_dt: float = 1e-3 
   preview_dt: float = 1e-3
   preview_horizon_steps: int = 400 
+  preview_state_source: Literal["desired_delay", "measured", "open_loop", "blended"] = "measured"
+  preview_blend_alpha: float = 0.05
 
   stabilizer_gains: StabilizerGains = StabilizerGains.diagonal()
 
@@ -124,6 +128,16 @@ class StackMurookaOutputs:
   debug: dict = field(default_factory=dict)
 
 
+@dataclass
+class DelayedPreviewState:
+  com: np.ndarray
+  com_vel: np.ndarray
+  com_acc: np.ndarray
+  phi_world: np.ndarray | None
+  omega_world: np.ndarray | None
+  alpha_world: np.ndarray | None
+
+
 class StackController: 
   """ 
   Explicit Murooka pipeline (preview -> projection -> one-step prediction -> stabilizer -> distribution).
@@ -143,14 +157,72 @@ class StackController:
     self.I_diag = I_diag
     
     self.preview = None 
-    if cfg.enable_preview_planner: 
+    if cfg.enable_preview_planner:
+      lin_cfg = PreviewConfig.build_linear(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps) 
+      ang_cfg = PreviewConfig.build_angular(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps) 
       self.preview = CentroidalPreviewPlanner(
         mass=self.mass, 
         I_diag=self.I_diag,
-        cfg=PreviewConfig(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps),
+        lin_cfg=lin_cfg,
+        ang_cfg=ang_cfg,
       )
 
       self._preview_inited = False
+      self._delayed_preview_state: DelayedPreviewState | None = None
+      self._preview_elapsed_since_update = 0.0
+      self._held_preview_ref: CentroidalReference | None = None
+      self._held_bar_wp: ResultantWrenchBar | None = None
+
+  @staticmethod
+  def _copy_preview_delay_state(
+    desired: CentroidalDesired,
+    com_acc: np.ndarray,
+    alpha_world: np.ndarray | None,
+  ) -> DelayedPreviewState:
+    phi_world = None
+    omega_world = None
+    if desired.base_R_world is not None and desired.base_omega_world is not None:
+      phi_world = logvec(np.asarray(desired.base_R_world, dtype=float).reshape(3, 3))
+      omega_world = np.asarray(desired.base_omega_world, dtype=float).reshape(3,).copy()
+    alpha_copy = None if alpha_world is None else np.asarray(alpha_world, dtype=float).reshape(3,).copy()
+    return DelayedPreviewState(
+      com=np.asarray(desired.com, dtype=float).reshape(3,).copy(),
+      com_vel=np.asarray(desired.com_vel, dtype=float).reshape(3,).copy(),
+      com_acc=np.asarray(com_acc, dtype=float).reshape(3,).copy(),
+      phi_world=phi_world,
+      omega_world=omega_world,
+      alpha_world=alpha_copy,
+    )
+
+  def _sync_preview_from_desired_delay(self) -> bool:
+    if self.preview is None or self._delayed_preview_state is None:
+      return False
+
+    delayed = self._delayed_preview_state
+
+    self.preview.sync_state(
+      delayed.com,
+      delayed.com_vel,
+      coma0=delayed.com_acc,
+      phi0=delayed.phi_world,
+      omega0=delayed.omega_world,
+      alpha0=delayed.alpha_world,
+    )
+    return True
+
+  def _preview_update_due(self) -> bool:
+    if not self._preview_inited:
+      return True
+
+    if self.cfg.preview_dt <= self.cfg.sim_dt + 1e-15:
+      return True
+
+    self._preview_elapsed_since_update += float(self.cfg.sim_dt)
+    if self._preview_elapsed_since_update + 1e-15 < float(self.cfg.preview_dt):
+      return False
+
+    self._preview_elapsed_since_update = self._preview_elapsed_since_update % float(self.cfg.preview_dt)
+    return True
   
   def _estimate_base(self, data: mujoco.MjData) -> BaseState | None: 
     if self.cfg.base_body_id is None: 
@@ -179,9 +251,6 @@ class StackController:
     if self.preview is None: 
       raise ValueError("Preview Planner disabled.")
     
-    # update preview values with current plant truth 
-    self.preview.update_from_meas(com, com_vel, base)
-    
     contact_model = build_contact_model_from_sites(
       self.model, data, 
       mu=self.cfg.mu, 
@@ -189,7 +258,7 @@ class StackController:
       frame_mode=self.cfg.contact_frame_mode,
     )
 
-    Nh = self.preview.cfg.horizon_steps
+    Nh = self.preview.lin_cfg.horizon_steps
 
     # scalar fallback 
     com_ref = np.asarray(ref_cmd.com_ref_world, dtype=float).reshape(3,)
@@ -241,34 +310,58 @@ class StackController:
         if bar_n_ref_seq.shape != (Nh, 3) or not np.all(np.isfinite(bar_n_ref_seq)):
           raise ValueError(f"bar_n_ref_seq_world must be finite {(Nh,3)}")
         
-    # init preview internal state 
+    preview_updated = False
+    just_initialized = False
+
+    # init / sync preview internal state
     if not self._preview_inited: 
       self._preview_inited = True 
+      just_initialized = True
       omega0 = base.omega_world if base is not None else None 
-      self.preview.reset(com0=com, comv0=com_vel, phi0=phi_ref, omega0=omega0)
-  
-    # 1. Preview --> Planned (rp, bar_wp)
-    if com_ref_seq is None: 
-      ref, bar_wp = self.preview.step_constant(
-        com_ref=com_ref, 
-        phi_ref=phi_ref, 
-        bar_f_ref=bar_f_ref, 
-        bar_n_ref=bar_n_ref,
-      )
-    else: 
-      ref, bar_wp = self.preview.step_preview(
-        com_ref_seq=com_ref_seq, 
-        phi_ref_seq=phi_ref_seq,
-        bar_f_ref_seq=bar_f_ref_seq,
-        bar_n_ref_seq=bar_n_ref_seq,
-      )
+      phi0 = base.phi_world if base is not None else phi_ref
+      self.preview.reset(com0=com, comv0=com_vel, phi0=phi0, omega0=omega0)
+    if just_initialized or self._preview_update_due():
+      if self.cfg.preview_state_source == "measured":
+        self.preview.update_from_meas(com, com_vel, base)
+      elif self.cfg.preview_state_source == "desired_delay":
+        synced = self._sync_preview_from_desired_delay()
+        if not synced:
+          self.preview.update_from_meas(com, com_vel, base)
+      elif self.cfg.preview_state_source == "open_loop":
+        pass  # LQT evolves from its own predicted state; no measurement sync
+      elif self.cfg.preview_state_source == "blended":
+        self.preview.blend_with_meas(self.cfg.preview_blend_alpha, com, com_vel, base)
+      else:
+        raise ValueError(f"Unsupported preview_state_source: {self.cfg.preview_state_source}")
 
-    # bar_wp.bar_moment_world must come from I_diag * phi_acc (explicit small angle approximation)
-    phi_acc = np.asarray(ref.meta.get("phi_acc", [0.0, 0.0, 0.0]), dtype=float).reshape(3,)
-    bar_wp = ResultantWrenchBar(
-      bar_force_world=np.asarray(bar_wp.bar_force_world, dtype=float).reshape(3,),
-      bar_moment_world=self.I_diag * phi_acc,
-    )
+      if com_ref_seq is None: 
+        ref, bar_wp = self.preview.step_constant(
+          com_ref=com_ref, 
+          phi_ref=phi_ref, 
+          bar_f_ref=bar_f_ref, 
+          bar_n_ref=bar_n_ref,
+        )
+      else: 
+        ref, bar_wp = self.preview.step_preview(
+          com_ref_seq=com_ref_seq, 
+          phi_ref_seq=phi_ref_seq,
+          bar_f_ref_seq=bar_f_ref_seq,
+          bar_n_ref_seq=bar_n_ref_seq,
+        )
+
+      phi_acc = np.asarray(ref.meta.get("phi_acc", [0.0, 0.0, 0.0]), dtype=float).reshape(3,)
+      bar_wp = ResultantWrenchBar(
+        bar_force_world=np.asarray(bar_wp.bar_force_world, dtype=float).reshape(3,),
+        bar_moment_world=self.I_diag * phi_acc,
+      )
+      self._held_preview_ref = ref
+      self._held_bar_wp = bar_wp
+      preview_updated = True
+    else:
+      ref = self._held_preview_ref
+      bar_wp = self._held_bar_wp
+      if ref is None or bar_wp is None:
+        raise RuntimeError("Preview hold requested before any preview state was cached")
 
     # 2. Wrench Projection, QP --> 'bar_wp_proj' 
     if self.cfg.enable_wrench_projection: 
@@ -291,8 +384,10 @@ class StackController:
     from lie_math import Exp
     phi_p = np.asarray(ref.meta["phi"])
     omega_p = np.asarray(ref.meta["omega"])
+    com_acc_des = np.asarray(bar_wp_proj.bar_force_world, dtype=float).reshape(3,) / float(self.mass)
+    alpha_des = None if base is None else np.asarray(bar_wp_proj.bar_moment_world, dtype=float).reshape(3,) / self.I_diag
     desired = predict_one_step(
-      dt=float(self.cfg.preview_dt), 
+      dt=float(self.cfg.sim_dt), 
       mass=self.mass, 
       I_diag=self.I_diag, 
       com=ref.com_ref,
@@ -355,7 +450,15 @@ class StackController:
       "projection": dbg_proj,
       "stabilizer": dbg_stab, 
       "distribution": dbg_dist, 
+      "preview_state_source": self.cfg.preview_state_source,
+      "preview_updated": preview_updated,
     }
+
+    self._delayed_preview_state = self._copy_preview_delay_state(
+      desired,
+      com_acc=com_acc_des,
+      alpha_world=alpha_des,
+    )
 
     return StackMurookaOutputs(
       contact_model=contact_model,

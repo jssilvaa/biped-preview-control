@@ -15,10 +15,10 @@ class StabilizerGains:
 
   @staticmethod 
   def diagonal(
-    kp_lin=(200.0, 200.0, 200.0),
+    kp_lin=(2000.0, 2000.0, 2000.0),
     kd_lin=(10.0, 10.0, 10.0),
-    kp_ang=(100.0, 100.0, 100.0),
-    kd_ang=(5.0, 5.0, 5.0),
+    kp_ang=(0.0, 0.0, 0.0),
+    kd_ang=(0.0, 0.0, 0.0),
   ) -> StabilizerGains: 
     return StabilizerGains(
       Kp_lin=np.diag(np.asarray(kp_lin, dtype=float)),

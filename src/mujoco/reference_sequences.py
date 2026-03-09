@@ -51,6 +51,47 @@ def sine_com_ref_seq(
   return out 
 
 
+def sine_com_bar_ref_seq(
+        k_preview: int,
+        dt_preview: float,
+        Nh: int,
+        com0: np.ndarray,
+        *,
+        axis: int,
+        amp: float,
+        freq_hz: float,
+        mass: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a dynamically consistent sinusoidal CoM reference together with the
+    matching bar-force reference under the simplified centroidal model used by the
+    preview controller:
+
+        c_ref(t) = c0 + A sin(omega t) e_axis
+        bar_f_ref(t) = m c_ddot_ref(t) = -m A omega^2 sin(omega t) e_axis
+    """
+    if not np.isfinite(mass) or mass <= 0.0:
+            raise ValueError("mass must be positive finite")
+
+    com_ref_seq = sine_com_ref_seq(
+            k_preview,
+            dt_preview,
+            Nh,
+            com0,
+            axis=axis,
+            amp=amp,
+            freq_hz=freq_hz,
+    )
+
+    omega = 2.0 * np.pi * float(freq_hz)
+    t = (k_preview + np.arange(Nh)) * float(dt_preview)
+    cdd = -float(amp) * (omega ** 2) * np.sin(omega * t)
+
+    bar_f_ref_seq = np.zeros((Nh, 3), dtype=float)
+    bar_f_ref_seq[:, axis] = float(mass) * cdd
+    return com_ref_seq, bar_f_ref_seq
+
+
 def zeros_bar_seq(Nh: int) -> tuple[np.ndarray, np.ndarray]: 
     """ 
     Returns (bar_f_ref_seq, bar_n_ref_seq) each (Nh,3) = zeros

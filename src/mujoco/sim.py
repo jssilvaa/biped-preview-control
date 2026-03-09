@@ -17,7 +17,7 @@ from contact_measurement import (
     measure_patch_wrenches_world,
 )
 
-from reference_sequences import sine_com_ref_seq, zeros_bar_seq
+from reference_sequences import sine_com_bar_ref_seq, sine_com_ref_seq, zeros_bar_seq
 from stack_controller import (
     StackController,
     StackControllerConfig,
@@ -53,14 +53,18 @@ class MurookaSimConfig:
   # centroidal / preview / stabilizer
   base_body_id: int | None = None       # must fill in for angular stabilization 
   I_diag: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0], dtype=float))
-  preview_dt: float = 1e-3 # match dt above
+  preview_dt: float = 5e-3 # match dt above
   preview_horizon_steps: int = 400 
+  preview_state_source: str = "measured"
+  preview_blend_alpha: float = 0.05
 
   # preview references 
   enable_motion_refs: bool = True 
   motion_axis: int = 0          # 0=x, 1=y, 2=z
   motion_amp: float = 0.2      # meters
   motion_freq_hz: float = 0.5   # Hz
+  motion_match_bar_force_ref: bool = True
+  reference_advance_steps: int = 0  # shift reference sequence forward in time to compensate preview lag
 
   # generator QP regularization terms 
   reg_projection: float = 1e-9
@@ -127,6 +131,8 @@ def run_simulation(
       mu=float(cfg.mu),
       preview_dt=float(cfg.preview_dt), 
       preview_horizon_steps=int(cfg.preview_horizon_steps),
+      preview_state_source=cfg.preview_state_source,
+      preview_blend_alpha=float(cfg.preview_blend_alpha),
       reg_projection=float(cfg.reg_projection),
       reg_distribution=float(cfg.reg_distribution),
       w_tan_projection=float(cfg.w_tan_projection),
@@ -191,6 +197,7 @@ def run_simulation(
 
   # Measure first CoM 
   com0_ref, _, = compute_com_state(model, data)
+  total_mass = float(np.sum(model.body_mass))
   base_ref = compute_base_state(model, data, cfg.base_body_id) if cfg.base_body_id is not None else None 
   
   # initialize reference scalars 
@@ -218,24 +225,50 @@ def run_simulation(
       k_preview = int(np.floor((k * cfg.dt) / cfg.preview_dt)) if cfg.dt != cfg.preview_dt else k
 
       if cfg.enable_motion_refs:
-          com_ref_seq = sine_com_ref_seq(
-              k_preview, cfg.preview_dt, Nh, com0_ref,
+          k_ref = k_preview + int(cfg.reference_advance_steps)
+          if cfg.motion_match_bar_force_ref:
+            com_ref_seq, bar_f_ref_seq = sine_com_bar_ref_seq(
+              k_ref,
+              cfg.preview_dt,
+              Nh,
+              com0_ref,
               axis=int(cfg.motion_axis),
               amp=float(cfg.motion_amp),
               freq_hz=float(cfg.motion_freq_hz),
-          )
+              mass=total_mass,
+            )
+          else:
+            com_ref_seq = sine_com_ref_seq(
+              k_ref, cfg.preview_dt, Nh, com0_ref,
+              axis=int(cfg.motion_axis),
+              amp=float(cfg.motion_amp),
+              freq_hz=float(cfg.motion_freq_hz),
+            )
+            bar_f_ref_seq = None
           com_ref_world = np.asarray(com_ref_seq[0], dtype=float).reshape(3,)
+          # For metrics: log the actual current-time reference (not the advanced one)
+          if int(cfg.reference_advance_steps) > 0:
+            com_ref_now = sine_com_ref_seq(
+              k_preview, cfg.preview_dt, 1, com0_ref,
+              axis=int(cfg.motion_axis), amp=float(cfg.motion_amp), freq_hz=float(cfg.motion_freq_hz),
+            )[0]
+            com_ref_world_log = np.asarray(com_ref_now, dtype=float).reshape(3,)
+          else:
+            com_ref_world_log = com_ref_world
       else: 
           com_ref_world = np.asarray(com0_ref, dtype=float).reshape(3,)
 
       if phi_ref_world is not None: 
         phi_ref_seq = np.tile(phi_ref_world, (Nh,1))
       
-      bar_f_ref_seq, bar_n_ref_seq = zeros_bar_seq(Nh)
+      if bar_f_ref_seq is None:
+        bar_f_ref_seq, bar_n_ref_seq = zeros_bar_seq(Nh)
+      else:
+        _, bar_n_ref_seq = zeros_bar_seq(Nh)
       bar_f_ref_world = np.asarray(bar_f_ref_seq[0], dtype=float).reshape(3,)
       bar_n_ref_world = np.asarray(bar_n_ref_seq[0], dtype=float).reshape(3,)
 
-      com_ref_cmd_log[k] = com_ref_world
+      com_ref_cmd_log[k] = com_ref_world_log if cfg.enable_motion_refs and int(cfg.reference_advance_steps) > 0 else com_ref_world
       bar_f_ref_cmd_log[k] = bar_f_ref_world
       bar_n_ref_cmd_log[k] = bar_n_ref_world
 
