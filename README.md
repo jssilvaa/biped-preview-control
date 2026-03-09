@@ -49,8 +49,6 @@ If the block diagram answers "what is the control architecture?" and the sequenc
 - `src/mujoco/` contains the modular implementation.
 - `src/mujoco/run_g1.py` is the main example runner for the current Unitree G1 setup.
 - `src/mujoco/inspect_g1.py` prints model ids, names, and other MuJoCo bookkeeping that is useful while wiring controllers.
-- `src/mujoco/verification/test_all.py` contains the current analytic test suite.
-- `src/mujoco/full.py` is a flattened generated copy of the modular code. If you change code, change the modular files, not the flattened one.
 
 Roughly speaking, the modules map onto the paper's pipeline like this:
 
