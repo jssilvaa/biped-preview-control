@@ -1,0 +1,6 @@
+matplotlib
+mujoco
+numpy
+osqp
+pytest
+scipy

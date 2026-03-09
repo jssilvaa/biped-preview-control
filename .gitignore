@@ -1,0 +1,28 @@
+# cache, notebooks stuff
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# LOGS
+MUJOCO_LOG.TXT
+results_g1_inspection.txt
+
+# settings and models   
+.vscode/
+models/ 
+
+# keep docs local 
+report/ 
+docs/
+
+# keep tests local for now 
+tests/
+*.sh
+full.py
+
+# Store backups locally 
+backup/
+
+# plots 
+plots_g1/

@@ -1,0 +1,118 @@
+import time
+from typing import Tuple
+
+import argparse 
+import mujoco  
+import numpy as np 
+
+from ik import compute_orientation_error, get_target_orientation
+from lie_math import JL_inv
+from viz import Viz
+
+
+def load_model(path: str) -> Tuple[mujoco.MjModel, mujoco.MjData]:
+  model = mujoco.MjModel.from_xml_path(path)
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  return model, data
+
+def home_key_id(model: mujoco.MjModel) -> int | None:
+    if model.nkey <= 0:
+        return None
+    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    return 0 if key_id < 0 else int(key_id)
+
+def solve_ik(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    target_R: np.ndarray, 
+    curr_idx: int, 
+    dt: float=0.002, 
+    lam: float=1e-3,
+    alpha: float=0.2,
+    tol: float=1e-6, 
+    max_iter: int=5000,
+): 
+  """ 
+    solves: 
+      dq = J.T @ (J @ J.T + lam * I3)^-1 @ e 
+      let y = J.T^-1 dq, then Ay = e, solve this 
+      where A = J @ J.T + lam * I3
+      solution is dq = J.T @ y
+  """
+  nq = model.nq 
+  nv = model.nv 
+  nu = model.nu 
+
+  Jp = np.zeros((3,nv))
+  Jr = np.zeros((3,nv))
+  Inu = np.eye(nu)
+
+  Kp = 250.0 
+  Kd = 30.0 
+  lam_ls = 1e-6
+  vizUtil = Viz(model, data)
+
+  for k in range(max_iter): 
+    mujoco.mj_forward(model, data)
+    mujoco.mj_jacBody(model, data, Jp, Jr, curr_idx)
+
+    curr_R = data.xmat[curr_idx].reshape(3,3).copy()
+    eR = compute_orientation_error(data, target_R, curr_R)
+    omega = data.cvel[curr_idx, :3].copy()
+    omega_d = np.zeros(3)
+    u = Kp * eR + Kd * (omega_d - omega)
+    tau_des = Jr.T @ u + data.qfrc_bias.copy()
+    tau_des[:6] = 0.0
+
+    M = build_joint_motor_moment_matrix(model).copy()
+    A = M.T @ M + lam_ls * Inu
+    b = M.T @ tau_des 
+    fstar = np.linalg.solve(A, b)
+    gain = model.actuator_gainprm[:nu, 0].copy()
+    ctrl = fstar / gain 
+
+    if model.actuator_ctrllimited.any(): 
+      lo = model.actuator_ctrlrange[:,0]
+      hi = model.actuator_ctrlrange[:,1]
+      ctrl = np.clip(ctrl, lo, hi)
+
+    data.ctrl[:] = ctrl 
+    mujoco.mj_step(model, data)
+    
+    if vizUtil is not None: 
+       vizUtil.update(data)
+
+
+def _main(): 
+  parser = argparse.ArgumentParser(description="Disturbance rejection with DLS. Trying to reject disturbances (with a fixed contact step) for a single leg, then might try Cassie (not for now tho).")
+  parser.add_argument("--cassie", action="store_true", default=False)
+  args = parser.parse_args()
+
+  if args.cassie: 
+    model, data = load_model("models/agility_cassie/scene.xml")
+    curr_idx = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cassie-pelvis")
+  else: 
+    model, data = load_model("models/leg/scene.xml")
+    curr_idx = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis_link")
+  
+  key_id = home_key_id(model) 
+  if key_id is not None: 
+    mujoco.mj_resetDataKeyframe(model, data, key_id)
+  else: 
+    mujoco.mj_resetData(model, data)
+
+  nq = model.nq 
+  nv = model.nv 
+  nu = model.nu 
+
+  # target orientation up 
+  zd = np.array([0,0,1],dtype=float)
+  up = np.array([0,1,0],dtype=float)
+  target_R = get_target_orientation(zd, up)
+
+  dt = model.opt.timestep
+  solve_ik(model, data, target_R, curr_idx, dt)
+
+if __name__ == "__main__": 
+   _main()
