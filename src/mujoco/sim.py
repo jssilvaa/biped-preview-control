@@ -1,7 +1,7 @@
 # sim.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -12,6 +12,7 @@ from viz import Viz
 
 from dynamics import compute_com_state, compute_base_state
 from contact_patches import PatchSpec
+from contact_patches import build_contact_model_from_sites
 from contact_measurement import (
     build_patch_geom_map_from_sites,
     measure_patch_wrenches_world,
@@ -32,9 +33,40 @@ from contact_phase import (
   select_patch_gains
 )
 
-from whole_body_ik import IKConfig, SiteTarget, solve_ik
-from joint_servo import JointServoConfig, compute_motor_ctrl_from_qpos_target, compute_position_ctrl_from_qpos_target
+from wbik_tasks import SiteTarget, build_wbik_task_set
+from whole_body_ik import IKConfig, solve_ik_tasks
+from whole_body_accel_ik import AccelIKConfig, solve_accel_ik_tasks
+from joint_groups import build_joint_group_map, posture_dof_weight_mask_from_contacts
+from joint_servo import (
+  JointServoConfig,
+  compute_affine_actuator_ctrl_from_joint_pd_targets,
+  compute_motor_ctrl_from_qpos_target,
+  compute_position_ctrl_from_qpos_target,
+)
 from lie_math import Exp
+from murooka_wrench import contact_wrench_about_origin_to_bar
+
+
+def _resultant_wrench_from_patch_wrenches(
+  patch_wrenches_world: list[np.ndarray],
+  contact_model,
+) -> np.ndarray:
+  w_total = np.zeros(6, dtype=float)
+  for i, w_patch in enumerate(patch_wrenches_world):
+    w_patch = np.asarray(w_patch, dtype=float).reshape(6,)
+    p0 = np.asarray(contact_model.patches[i].p_w, dtype=float).reshape(3,)
+    F = w_patch[:3]
+    tau0 = w_patch[3:] + np.cross(p0, F)
+    w_total[:3] += F
+    w_total[3:] += tau0
+  return w_total
+
+
+def _model_uses_motor_actuators(model: mujoco.MjModel) -> bool:
+  if model.nu <= 0:
+    return False
+  bias = np.asarray(model.actuator_biasprm[:, :3], dtype=float)
+  return bool(np.allclose(bias, 0.0))
 
 
 @dataclass(frozen=True)
@@ -55,8 +87,18 @@ class MurookaSimConfig:
   I_diag: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0], dtype=float))
   preview_dt: float = 5e-3 # match dt above
   preview_horizon_steps: int = 400 
+  preview_controller_mode: str = "lqt"
+  preview_linear_position_scale: float = 0.05
+  preview_angular_position_scale: float = 0.10
+  preview_nominal_freq_hz: float = 0.5
+  preview_q_pos_override: float | None = None
+  preview_q_wrench_override: float | None = None
+  preview_r_jerk_override: float | None = None
+  preview_ki_pos_override: float | None = None
   preview_state_source: str = "measured"
   preview_blend_alpha: float = 0.05
+  enable_centroidal_stabilizer: bool = True
+  execution_backend: str = "position_ik"
 
   # preview references 
   enable_motion_refs: bool = True 
@@ -76,11 +118,18 @@ class MurookaSimConfig:
   phase_gains: PhaseGains = PhaseGains.murooka_table_ii()
   fn_on: float = 30.0 
   fn_off: float = 10.0 
+  enable_damping_control: bool = True
 
   # IK 
   ik_cfg: IKConfig = IKConfig(base_body_id=base_body_id)
+  accel_ik_cfg: AccelIKConfig = field(default_factory=AccelIKConfig)
+
+  # observer hooks (inactive in Phase A)
+  observer_external_bar_wrench_world: np.ndarray | None = None
+  disturbance_gate_active: bool = False
 
   # joint servo 
+  servo_mode: str = "auto"
   servo_cfg: JointServoConfig = JointServoConfig()
 
   # viz 
@@ -102,6 +151,7 @@ def run_simulation(
 
   sids = site_ids(model, cfg.site_names)
   nc = len(sids)
+  joint_groups = build_joint_group_map(model)
 
   floor_gid = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, cfg.floor_geom_name))
   if floor_gid < 0: 
@@ -126,11 +176,20 @@ def run_simulation(
       enable_preview_planner=True,
       enable_wrench_projection=True, 
       enable_wrench_distribution=True,
+      enable_centroidal_stabilizer=bool(cfg.enable_centroidal_stabilizer),
       base_body_id=cfg.base_body_id,
       I_diag=np.asarray(cfg.I_diag, dtype=float).reshape(3,),
       mu=float(cfg.mu),
       preview_dt=float(cfg.preview_dt), 
       preview_horizon_steps=int(cfg.preview_horizon_steps),
+      preview_controller_mode=str(cfg.preview_controller_mode),
+      preview_linear_position_scale=float(cfg.preview_linear_position_scale),
+      preview_angular_position_scale=float(cfg.preview_angular_position_scale),
+      preview_nominal_freq_hz=float(cfg.preview_nominal_freq_hz),
+      preview_q_pos_override=None if cfg.preview_q_pos_override is None else float(cfg.preview_q_pos_override),
+      preview_q_wrench_override=None if cfg.preview_q_wrench_override is None else float(cfg.preview_q_wrench_override),
+      preview_r_jerk_override=None if cfg.preview_r_jerk_override is None else float(cfg.preview_r_jerk_override),
+      preview_ki_pos_override=None if cfg.preview_ki_pos_override is None else float(cfg.preview_ki_pos_override),
       preview_state_source=cfg.preview_state_source,
       preview_blend_alpha=float(cfg.preview_blend_alpha),
       reg_projection=float(cfg.reg_projection),
@@ -146,6 +205,11 @@ def run_simulation(
 
   # Compliance states per patch 
   comp = [ComplianceState.zero() for _ in range(nc)]
+  qpos_des_state = data.qpos.copy()
+  qvel_des_state = data.qvel.copy()
+
+  ik_cfg = cfg.ik_cfg if cfg.ik_cfg.base_body_id is not None else replace(cfg.ik_cfg, base_body_id=cfg.base_body_id)
+  accel_ik_cfg = cfg.accel_ik_cfg if cfg.accel_ik_cfg.base_body_id is not None else replace(cfg.accel_ik_cfg, base_body_id=cfg.base_body_id)
 
   # Nominal (stance) site pose targets (captured at k=0)
   mujoco.mj_forward(model, data)
@@ -173,6 +237,7 @@ def run_simulation(
   w_des_log = np.zeros((cfg.N, nc, 6), dtype=float)
   w_meas_log = np.zeros((cfg.N, nc, 6), dtype=float)
   dr_log = np.zeros((cfg.N, nc, 6), dtype=float)
+  drdot_log = np.zeros((cfg.N, nc, 6), dtype=float)
 
   # Per block logs: 
   # Includes: 
@@ -187,9 +252,37 @@ def run_simulation(
   
   w_cmd_log = np.zeros((cfg.N, 6), dtype=float)
   w_real_log = np.full((cfg.N, 6), np.nan, dtype=float)
+  w_meas_resultant_log = np.full((cfg.N, 6), np.nan, dtype=float)
   w_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
   w_force_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
   w_moment_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  w_exec_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  w_exec_force_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  w_exec_moment_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  preview_state_pre_sync_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  preview_vel_pre_sync_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  preview_acc_pre_sync_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  preview_alpha_pre_sync_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  preview_acc_post_sync_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  preview_alpha_post_sync_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  stabilizer_overwrite_ratio_log = np.full(cfg.N, np.nan, dtype=float)
+  qacc_cmd_log = np.full((cfg.N, model.nv), np.nan, dtype=float)
+  qvel_des_log = np.full((cfg.N, model.nv), np.nan, dtype=float)
+  qpos_des_log = np.full((cfg.N, model.nq), np.nan, dtype=float)
+  ctrl_log = np.full((cfg.N, model.nu), np.nan, dtype=float)
+  wbik_com_acc_residual_log = np.full((cfg.N, 3), np.nan, dtype=float)
+  wbik_base_alpha_residual_log = np.full((cfg.N, 3), np.nan, dtype=float)
+  wbik_site_pos_acc_residual_log = np.full((cfg.N, nc, 3), np.nan, dtype=float)
+  wbik_site_rot_acc_residual_log = np.full((cfg.N, nc, 3), np.nan, dtype=float)
+  wbik_stage1_slack_rms_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_stage2_slack_rms_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_stage1_preserved_resid_rms_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_stage2_preserved_resid_rms_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_joint_limit_active_count_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_preserve_retry_count_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_stage1_tol_used_log = np.full(cfg.N, np.nan, dtype=float)
+  wbik_stage2_tol_used_log = np.full(cfg.N, np.nan, dtype=float)
+  accel_ik_failed_log = np.zeros(cfg.N, dtype=bool)
   
   #NOTE: Due to the way the control is made, patches are measured from the previous state, and gains match the patch status from the previous control cycle 
   # patches with 1*cfg.dt seconds of delay
@@ -283,9 +376,47 @@ def run_simulation(
           bar_n_ref_seq_world=bar_n_ref_seq,
       )
 
+      contact_model_now = build_contact_model_from_sites(
+        model,
+        data,
+        mu=float(cfg.mu),
+        patch_specs=patch_specs,
+        frame_mode="world_up",
+      )
+      w_meas_pre = measure_patch_wrenches_world(
+        model,
+        data,
+        floor_geom_id=floor_gid,
+        contact_model=contact_model_now,
+        geom_map=geom_map,
+        min_normal_force=0.0,
+      )
+      w_meas_resultant = _resultant_wrench_from_patch_wrenches(
+        w_meas_pre,
+        contact_model_now,
+      )
+      bar_w_meas = contact_wrench_about_origin_to_bar(
+        w_meas_resultant,
+        com_world=com_now,
+        mass=total_mass,
+        gravity_world=model.opt.gravity.copy(),
+      )
+      com_acc_meas = np.asarray(bar_w_meas.bar_force_world, dtype=float).reshape(3,) / float(total_mass)
+      alpha_meas = np.asarray(bar_w_meas.bar_moment_world, dtype=float).reshape(3,) / np.asarray(cfg.I_diag, dtype=float).reshape(3,)
+
       # run the full pipeline with patch active 
       patch_active_log[k] = patch_active
-      out = stack.step(data=data, patch_specs=patch_specs, ref_cmd=ref_cmd, patch_active=patch_active)
+      out = stack.step(
+        data=data,
+        patch_specs=patch_specs,
+        ref_cmd=ref_cmd,
+        patch_active=patch_active,
+        measured_com_acc_world=com_acc_meas,
+        measured_alpha_world=alpha_meas,
+        measured_resultant_wrench_world=w_meas_resultant,
+        external_bar_wrench_estimate_world=cfg.observer_external_bar_wrench_world,
+        disturbance_gate_active=bool(cfg.disturbance_gate_active),
+      )
 
       # log data 
       bar_wp_log[k] = np.hstack((out.bar_wp.bar_force_world, out.bar_wp.bar_moment_world))
@@ -304,13 +435,7 @@ def run_simulation(
       com_preview_log[k] = np.asarray(out.preview_state.com_ref, dtype=float).reshape(3,)
 
       # get measured and desired wrenches 
-      w_meas = measure_patch_wrenches_world(
-         model, data, 
-         floor_geom_id=floor_gid, 
-         contact_model=out.contact_model, 
-         geom_map=geom_map,
-         min_normal_force=0.0,
-      )
+      w_meas = w_meas_pre
       if len(w_meas) != nc: 
          raise RuntimeError(f"w_meas length mismatch. expected {nc}, got {len(w_meas)} instead.")
 
@@ -318,6 +443,24 @@ def run_simulation(
       if len(w_des) != nc: 
         raise RuntimeError(f"patch_wrenches_world length mismatch. expected {nc}, got {len(w_des)}") 
       
+      w_meas_resultant_log[k] = w_meas_resultant
+      w_exec_force_err_norm_log[k] = np.linalg.norm(w_cmd_log[k, :3] - w_meas_resultant[:3])
+      w_exec_moment_err_norm_log[k] = np.linalg.norm(w_cmd_log[k, 3:] - w_meas_resultant[3:])
+      w_exec_err_norm_log[k] = np.linalg.norm(w_cmd_log[k] - w_meas_resultant)
+
+      dbg = out.debug
+      pre_sync = dbg.get("preview_state_error_pre_sync")
+      if pre_sync is not None:
+        preview_state_pre_sync_err_norm_log[k] = float(pre_sync.get("com_err_norm", np.nan))
+        preview_vel_pre_sync_err_norm_log[k] = float(pre_sync.get("com_vel_err_norm", np.nan))
+        preview_acc_pre_sync_err_norm_log[k] = float(pre_sync.get("com_acc_err_norm", np.nan))
+        preview_alpha_pre_sync_err_norm_log[k] = float(pre_sync.get("alpha_err_norm", np.nan))
+      post_sync = dbg.get("preview_state_error_post_sync")
+      if post_sync is not None:
+        preview_acc_post_sync_err_norm_log[k] = float(post_sync.get("com_acc_err_norm", np.nan))
+        preview_alpha_post_sync_err_norm_log[k] = float(post_sync.get("alpha_err_norm", np.nan))
+      stabilizer_overwrite_ratio_log[k] = float(dbg.get("stabilizer_overwrite_ratio", np.nan))
+
       # compute normal forces in patch frame 
       fn = np.zeros(nc, dtype=float)
       for i in range(nc): 
@@ -330,15 +473,19 @@ def run_simulation(
       gains_per_patch = select_patch_gains(patch_active, cfg.phase_gains)
       # patch_active = hyst.update(fn)
 
-      # Damping Control Update --> compliance dr 
-      for i in range(nc): 
-        comp[i] = damping_step(
-          dt=float(cfg.dt), 
-          gains=gains_per_patch[i], 
-          state=comp[i],
-          w_meas=np.asarray(w_meas[i], dtype=float).reshape(6,),
-          w_des=np.asarray(w_des[i], dtype=float).reshape(6,),
-        )
+      # Damping Control Update --> compliance dr
+      if cfg.enable_damping_control:
+        for i in range(nc): 
+          comp[i] = damping_step(
+            dt=float(cfg.dt), 
+            gains=gains_per_patch[i], 
+            state=comp[i],
+            w_meas=np.asarray(w_meas[i], dtype=float).reshape(6,),
+            w_des=np.asarray(w_des[i], dtype=float).reshape(6,),
+          )
+      else:
+        for i in range(nc):
+          comp[i] = ComplianceState.zero()
 
       # IK Targets: stance Pose + compliance offsets 
       site_targets: list[SiteTarget] = []
@@ -347,26 +494,110 @@ def run_simulation(
         dphi = comp[i].dr[3:]
         p_t = stance_pos[i] + dp 
         R_t = Exp(dphi) @ stance_R[i]
-        site_targets.append(SiteTarget(site_id=int(sid), p_world=p_t, R_world=R_t))
+        site_targets.append(
+          SiteTarget(
+            site_id=int(sid),
+            p_world=p_t,
+            R_world=R_t,
+            v_world=np.asarray(comp[i].drdot[:3], dtype=float).reshape(3,),
+            omega_world=np.asarray(comp[i].drdot[3:], dtype=float).reshape(3,),
+          )
+        )
 
       # CoM target 
       com_t = np.asarray(out.desired_state.com, dtype=float).reshape(3,)
       com_des_log[k] = com_t 
-
-      # Base R target 
-      base_R_t = np.asarray(out.desired_state.base_R_world, dtype=float).reshape(3,3)
-
-      qpos_des = solve_ik(
-        model, data,
-        com_target=com_t, 
+      posture_mask = posture_dof_weight_mask_from_contacts(
+        model,
+        site_names=cfg.site_names,
+        patch_active=patch_active,
+        joint_groups=joint_groups,
+      )
+      wbik_tasks = build_wbik_task_set(
+        desired=out.desired_state,
         site_targets=site_targets,
         qpos_nominal=qpos_nominal,
-        cfg=cfg.ik_cfg,
-        base_R_target=base_R_t,
+        posture_dof_weight_mask=posture_mask,
       )
 
-      ctrl = compute_position_ctrl_from_qpos_target(model, qpos_des)
-      data.ctrl[:] = ctrl 
+      qpos_des = qpos_des_state.copy()
+      if cfg.execution_backend == "position_ik":
+        qpos_des = solve_ik_tasks(
+          model,
+          data,
+          tasks=wbik_tasks,
+          cfg=ik_cfg,
+        )
+        qpos_des_state = qpos_des.copy()
+        qpos_des_log[k] = qpos_des
+      elif cfg.execution_backend == "accel_wbik":
+        try:
+          accel_result = solve_accel_ik_tasks(
+            model,
+            data,
+            tasks=wbik_tasks,
+            qpos_des_prev=qpos_des_state,
+            qvel_des_prev=qvel_des_state,
+            cfg=accel_ik_cfg,
+            dt=float(cfg.dt),
+          )
+          qpos_des = accel_result.qpos_des
+          qpos_des_state = accel_result.qpos_des.copy()
+          qvel_des_state = accel_result.qvel_des.copy()
+          qacc_cmd_log[k] = accel_result.qacc_cmd
+          qvel_des_log[k] = accel_result.qvel_des
+          qpos_des_log[k] = accel_result.qpos_des
+          wbik_com_acc_residual_log[k] = np.asarray(accel_result.task_residuals["com_acc"], dtype=float).reshape(3,)
+          wbik_base_alpha_residual_log[k] = np.asarray(accel_result.task_residuals["base_alpha"], dtype=float).reshape(3,)
+          wbik_stage1_slack_rms_log[k] = float(accel_result.diagnostics.get("stage1_slack_rms", np.nan))
+          wbik_stage2_slack_rms_log[k] = float(accel_result.diagnostics.get("stage2_slack_rms", np.nan))
+          wbik_stage1_preserved_resid_rms_log[k] = float(accel_result.diagnostics.get("stage1_preserved_resid_rms", np.nan))
+          wbik_stage2_preserved_resid_rms_log[k] = float(accel_result.diagnostics.get("stage2_preserved_resid_rms", np.nan))
+          wbik_joint_limit_active_count_log[k] = float(accel_result.diagnostics.get("joint_limit_active_count", np.nan))
+          wbik_preserve_retry_count_log[k] = float(accel_result.diagnostics.get("preserve_retry_count", np.nan))
+          wbik_stage1_tol_used_log[k] = float(accel_result.diagnostics.get("stage1_tol_used", np.nan))
+          wbik_stage2_tol_used_log[k] = float(accel_result.diagnostics.get("stage2_tol_used", np.nan))
+          for i in range(nc):
+            wbik_site_pos_acc_residual_log[k, i] = np.asarray(accel_result.task_residuals["site_pos_acc"][i], dtype=float).reshape(3,)
+            wbik_site_rot_acc_residual_log[k, i] = np.asarray(accel_result.task_residuals["site_rot_acc"][i], dtype=float).reshape(3,)
+        except Exception:
+          accel_ik_failed_log[k] = True
+          qpos_des = qpos_des_state.copy()
+          qacc_cmd_log[k] = np.zeros(model.nv, dtype=float)
+          qvel_des_log[k] = qvel_des_state.copy()
+          qpos_des_log[k] = qpos_des_state.copy()
+      else:
+        raise ValueError(f"Unsupported execution_backend: {cfg.execution_backend}")
+
+      servo_mode = str(cfg.servo_mode)
+      if servo_mode == "auto":
+        if cfg.execution_backend == "accel_wbik":
+          servo_mode = "motor_pd" if _model_uses_motor_actuators(model) else "actuator_pd"
+        else:
+          servo_mode = "position_target"
+
+      if servo_mode == "position_target":
+        ctrl = compute_position_ctrl_from_qpos_target(model, qpos_des)
+      elif servo_mode == "actuator_pd":
+        ctrl = compute_affine_actuator_ctrl_from_joint_pd_targets(
+          model,
+          data,
+          qpos_des=qpos_des,
+          qvel_des=qvel_des_state,
+          cfg=cfg.servo_cfg,
+        )
+      elif servo_mode == "motor_pd":
+        ctrl = compute_motor_ctrl_from_qpos_target(
+          model,
+          data,
+          qpos_des=qpos_des,
+          qvel_des=qvel_des_state,
+          cfg=cfg.servo_cfg,
+        )
+      else:
+        raise ValueError(f"Unsupported servo_mode: {cfg.servo_mode}")
+      data.ctrl[:] = ctrl
+      ctrl_log[k] = ctrl
 
       mujoco.mj_step(model, data)
 
@@ -376,6 +607,7 @@ def run_simulation(
         w_des_log[k, i] = np.asarray(w_des[i], dtype=float).reshape(6,)
         w_meas_log[k, i] = np.asarray(w_meas[i], dtype=float).reshape(6,)
         dr_log[k, i] = comp[i].dr.copy()
+        drdot_log[k, i] = comp[i].drdot.copy()
       
       if viewer is not None and (k % int(cfg.display_every) == 0): 
         viewer.update(data)
@@ -391,6 +623,7 @@ def run_simulation(
       w_des_log=w_des_log, 
       w_meas_log=w_meas_log,
       dr_log=dr_log,
+      drdot_log=drdot_log,
       bar_wp_log=bar_wp_log, 
       bar_wp_proj_log=bar_wp_proj_log,
       bar_wd_log=bar_wd_log,
@@ -398,9 +631,38 @@ def run_simulation(
       bar_n_ref_cmd_log=bar_n_ref_cmd_log,
       w_cmd_log=w_cmd_log,
       w_real_log=w_real_log,
+      w_meas_resultant_log=w_meas_resultant_log,
       w_err_norm_log=w_err_norm_log,
       w_force_err_norm_log=w_force_err_norm_log,
       w_moment_err_norm_log=w_moment_err_norm_log,
+      w_exec_err_norm_log=w_exec_err_norm_log,
+      w_exec_force_err_norm_log=w_exec_force_err_norm_log,
+      w_exec_moment_err_norm_log=w_exec_moment_err_norm_log,
+      preview_state_pre_sync_err_norm_log=preview_state_pre_sync_err_norm_log,
+      preview_vel_pre_sync_err_norm_log=preview_vel_pre_sync_err_norm_log,
+      preview_acc_pre_sync_err_norm_log=preview_acc_pre_sync_err_norm_log,
+      preview_alpha_pre_sync_err_norm_log=preview_alpha_pre_sync_err_norm_log,
+      preview_acc_post_sync_err_norm_log=preview_acc_post_sync_err_norm_log,
+      preview_alpha_post_sync_err_norm_log=preview_alpha_post_sync_err_norm_log,
+      stabilizer_overwrite_ratio_log=stabilizer_overwrite_ratio_log,
+      qacc_cmd_log=qacc_cmd_log,
+      qvel_des_log=qvel_des_log,
+      qpos_des_log=qpos_des_log,
+      ctrl_log=ctrl_log,
+      wbik_com_acc_residual_log=wbik_com_acc_residual_log,
+      wbik_base_alpha_residual_log=wbik_base_alpha_residual_log,
+      wbik_site_pos_acc_residual_log=wbik_site_pos_acc_residual_log,
+      wbik_site_rot_acc_residual_log=wbik_site_rot_acc_residual_log,
+      wbik_stage1_slack_rms_log=wbik_stage1_slack_rms_log,
+      wbik_stage2_slack_rms_log=wbik_stage2_slack_rms_log,
+      wbik_stage1_preserved_resid_rms_log=wbik_stage1_preserved_resid_rms_log,
+      wbik_stage2_preserved_resid_rms_log=wbik_stage2_preserved_resid_rms_log,
+      wbik_joint_limit_active_count_log=wbik_joint_limit_active_count_log,
+      wbik_preserve_retry_count_log=wbik_preserve_retry_count_log,
+      wbik_stage1_tol_used_log=wbik_stage1_tol_used_log,
+      wbik_stage2_tol_used_log=wbik_stage2_tol_used_log,
+      accel_ik_failed_log=accel_ik_failed_log,
+      wbik_solver_mode=str(accel_ik_cfg.solver_mode),
     )
   
   finally: 

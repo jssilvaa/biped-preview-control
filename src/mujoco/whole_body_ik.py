@@ -6,6 +6,7 @@ import mujoco
 
 from lie_math import logvec
 from misc import check_finite
+from wbik_tasks import BaseOrientationTask, CoMTask, PostureTask, SiteTarget, WBIKTaskSet
 
 
 @dataclass(frozen=True)
@@ -19,13 +20,6 @@ class IKConfig:
     w_site_pos: float = 10.0
     w_site_rot: float = 10.0
     base_body_id: int | None = None
-
-
-@dataclass(frozen=True)
-class SiteTarget:
-    site_id: int
-    p_world: np.ndarray
-    R_world: np.ndarray
 
 
 def _site_pose_world(data: mujoco.MjData, site_id: int) -> tuple[np.ndarray, np.ndarray]:
@@ -67,6 +61,41 @@ def solve_ik(
     cfg: IKConfig,
     base_R_target: np.ndarray | None = None,
 ) -> np.ndarray:
+    com_task = CoMTask(
+        p_world=check_finite("com_target", np.asarray(com_target, dtype=float).reshape(3,)),
+    )
+    base_task = None
+    if base_R_target is not None:
+        base_task = BaseOrientationTask(
+            R_world=check_finite(
+                "base_R_target",
+                np.asarray(base_R_target, dtype=float).reshape(3, 3),
+            ),
+        )
+    posture_task = None
+    if qpos_nominal is not None:
+        posture_task = PostureTask(
+            qpos_nominal=check_finite(
+                "qpos_nominal",
+                np.asarray(qpos_nominal, dtype=float).reshape(model.nq,),
+            ),
+        )
+    tasks = WBIKTaskSet(
+        com=com_task,
+        site_targets=list(site_targets),
+        base=base_task,
+        posture=posture_task,
+    )
+    return solve_ik_tasks(model, data, tasks=tasks, cfg=cfg)
+
+
+def solve_ik_tasks(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    tasks: WBIKTaskSet,
+    cfg: IKConfig,
+) -> np.ndarray:
     """
     Returns qpos_des computed by damped Gauss-Newton on stacked tasks.
 
@@ -84,22 +113,21 @@ def solve_ik(
         qpos differences into nq/nv-consistent generalized coordinates.
       - data.qpos is restored before returning.
     """
-    com_target = check_finite("com_target", np.asarray(com_target, dtype=float).reshape(3,))
     q0 = data.qpos.copy()
-
-    if qpos_nominal is None:
-        qpos_nom = q0.copy()
-    else:
-        qpos_nom = check_finite(
-            "qpos_nominal",
-            np.asarray(qpos_nominal, dtype=float).reshape(model.nq,),
-        )
-
-    if base_R_target is not None:
-        base_R_target = check_finite(
-            "base_R_target",
-            np.asarray(base_R_target, dtype=float).reshape(3, 3),
-        )
+    com_target = check_finite("tasks.com.p_world", np.asarray(tasks.com.p_world, dtype=float).reshape(3,))
+    qpos_nom = q0.copy() if tasks.posture is None else check_finite(
+        "tasks.posture.qpos_nominal",
+        np.asarray(tasks.posture.qpos_nominal, dtype=float).reshape(model.nq,),
+    )
+    posture_mask = np.ones(model.nv, dtype=float) if tasks.posture is None or tasks.posture.dof_weight_mask is None else check_finite(
+        "tasks.posture.dof_weight_mask",
+        np.asarray(tasks.posture.dof_weight_mask, dtype=float).reshape(model.nv,),
+    )
+    base_R_target = None if tasks.base is None else check_finite(
+        "tasks.base.R_world",
+        np.asarray(tasks.base.R_world, dtype=float).reshape(3, 3),
+    )
+    site_targets = list(tasks.site_targets)
 
     for _ in range(int(cfg.max_iters)):
         mujoco.mj_forward(model, data)
@@ -163,7 +191,7 @@ def solve_ik(
 
         rows.append(np.eye(model.nv, dtype=float))
         rhs.append(e_q)
-        W.append(np.full(model.nv, float(cfg.w_posture), dtype=float))
+        W.append(float(cfg.w_posture) * posture_mask)
 
         # Weighted damped least squares:
         #   min || sqrt(W) (A dq - b) ||^2 + λ ||dq||^2

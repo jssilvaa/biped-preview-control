@@ -107,5 +107,6 @@ def measure_patch_wrenches_world(
     # if no patch mathes, drop the contact 
     if not assigned: 
       print(f"{robot_gid} not assigned to any known robot patch in {geom_map.__repr__}")
+      raise RuntimeError("Robot fell!") # for now, we will work with static and sinusoidal references, with the feet planted on the ground. any new geoms entering in contact to the ground mean the robot has fallen. 
 
   return w_patch 

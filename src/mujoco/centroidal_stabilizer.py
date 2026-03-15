@@ -16,7 +16,7 @@ class StabilizerGains:
   @staticmethod 
   def diagonal(
     kp_lin=(2000.0, 2000.0, 2000.0),
-    kd_lin=(10.0, 10.0, 10.0),
+    kd_lin=(666.0, 666.0, 666.0),
     kp_ang=(0.0, 0.0, 0.0),
     kd_ang=(0.0, 0.0, 0.0),
   ) -> StabilizerGains: 
@@ -25,6 +25,15 @@ class StabilizerGains:
       Kd_lin=np.diag(np.asarray(kd_lin, dtype=float)),
       Kp_ang=np.diag(np.asarray(kp_ang, dtype=float)),
       Kd_ang=np.diag(np.asarray(kd_ang, dtype=float)),
+    )
+
+  @staticmethod
+  def murooka_table_iii() -> StabilizerGains:
+    return StabilizerGains.diagonal(
+      kp_lin=(2000.0, 2000.0, 2000.0),
+      kd_lin=(666.0, 666.0, 666.0),
+      kp_ang=(0.0, 0.0, 0.0),
+      kd_ang=(0.0, 0.0, 0.0),
     )
   
 

@@ -16,7 +16,7 @@ class PhaseGains:
         # Table II
         contact = DampingGains(
             Kd=np.array([10000, 10000, 10000, 100, 100, 100], dtype=float),
-            Ks=np.array([0, 0, 0, 500, 500, 2000], dtype=float),
+            Ks=np.array([0, 0, 0, 0, 0, 2000], dtype=float),
             Kf=np.array([1, 1, 1, 1, 1, 0], dtype=float),
         )
         noncontact = DampingGains(

@@ -45,6 +45,7 @@ def predict_one_step(
 
   R_d = None 
   omega_d = None 
+  omegadot = None
   if base_R is not None and base_omega is not None: 
     R = np.asarray(base_R, dtype=float).reshape(3,3)
     omega = np.asarray(base_omega, dtype=float).reshape(3,)
@@ -57,4 +58,6 @@ def predict_one_step(
     com_vel=cd_d,
     base_R_world=R_d,
     base_omega_world=omega_d,
+    com_acc=cdd,
+    base_alpha_world=omegadot,
   )

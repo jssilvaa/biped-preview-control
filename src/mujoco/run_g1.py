@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -14,6 +15,12 @@ STAND_KEY = 0
 BASE_BODY_ID = 1
 FLOOR_GEOM_NAME = "floor"
 SITE_NAMES = ["left_foot", "right_foot"]
+SceneVariant = Literal["position_scene", "motor_scene"]
+
+SCENE_PATHS: dict[SceneVariant, Path] = {
+    "position_scene": Path("models/unitree_g1/scene.xml"),
+    "motor_scene": Path("models/unitree_g1/scene_motor.xml"),
+}
 
 FOOT_VERTS = np.array([
     [ 0.07,  0.035, -0.03],
@@ -21,6 +28,13 @@ FOOT_VERTS = np.array([
     [-0.07,  0.035, -0.03],
     [-0.07, -0.035, -0.03],
 ], dtype=float)
+
+
+def scene_path_for_variant(scene_variant: SceneVariant = "position_scene") -> Path:
+    try:
+        return SCENE_PATHS[scene_variant]
+    except KeyError as exc:
+        raise ValueError(f"Unknown scene_variant: {scene_variant}") from exc
 
 
 def _time_axis(out: dict, dt: float) -> np.ndarray:
@@ -438,7 +452,7 @@ def make_plots(out: dict, dt: float, save_dir: str | Path = "plots_g1") -> None:
 
 
 def _main():
-    model = mujoco.MjModel.from_xml_path("models/unitree_g1/scene.xml")
+    model = mujoco.MjModel.from_xml_path(str(scene_path_for_variant("position_scene")))
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, STAND_KEY)
 
@@ -463,7 +477,7 @@ def _main():
         site_vertex_offsets=site_vertex_offsets,
         base_body_id=BASE_BODY_ID,
         I_diag=model.body_inertia[BASE_BODY_ID],
-        viz=False,
+        viz=True,
         display_every=4,
     )
 

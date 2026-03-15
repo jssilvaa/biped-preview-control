@@ -109,3 +109,96 @@ class FiniteHorizonPreviewLQT:
     u0 = -K0 @ x + u_ff
     x1 = self.A @ x + self.B @ u0
     return u0, x1
+
+
+class InfiniteHorizonPreviewLQT:
+  """
+  Infinite-horizon preview tracker for:
+    x_{k+1} = A x_k + B u_k
+    y_k = C x_k
+
+  Cost:
+    sum_{i=k..inf} (y_i - yref_i)^T Qy (y_i - yref_i) + u_i^T R u_i
+
+  The control law matches the fixed-gain preview structure used in Murooka Eq. (5):
+    u_k = -Kfb x_k + sum_{i=1..Nh} Kff[i] yref_{k+i}
+  """
+
+  def __init__(
+    self,
+    model: LQTModel,
+    w: LQTWeights,
+    horizon: int,
+    *,
+    tol: float = 1e-12,
+    max_iter: int = 100000,
+  ):
+    A = check_finite("A", model.A)
+    B = check_finite("B", model.B)
+    C = check_finite("C", model.C)
+    Qy = check_finite("Qy", w.Qy)
+    R = check_finite("R", w.R)
+
+    nx = A.shape[0]
+    if A.shape != (nx, nx):
+      raise ValueError("A must be square")
+    if B.shape[0] != nx:
+      raise ValueError("B rows must match A")
+    nu = B.shape[1]
+    ny = C.shape[0]
+    if C.shape[1] != nx:
+      raise ValueError("C cols must match A")
+    if Qy.shape != (ny, ny):
+      raise ValueError("Qy must match output dimension")
+    if R.shape != (nu, nu):
+      raise ValueError("R must match input dimension")
+    if horizon <= 0:
+      raise ValueError("horizon must be positive")
+
+    self.A, self.B, self.C = A, B, C
+    self.Qy, self.R = Qy, R
+    self.nx, self.nu, self.ny = nx, nu, ny
+    self.N = int(horizon)
+
+    Qx = C.T @ Qy @ C
+    P = Qx.copy()
+    for _ in range(max_iter):
+      S = R + B.T @ P @ B
+      S = 0.5 * (S + S.T)
+      K = np.linalg.solve(S, B.T @ P @ A)
+      P_next = Qx + A.T @ P @ A - A.T @ P @ B @ K
+      P_next = 0.5 * (P_next + P_next.T)
+      if np.linalg.norm(P_next - P, ord="fro") <= tol * max(1.0, np.linalg.norm(P_next, ord="fro")):
+        P = P_next
+        break
+      P = P_next
+    else:
+      raise RuntimeError("Infinite-horizon preview Riccati iteration did not converge")
+
+    self.P = P
+    self.S = 0.5 * ((R + B.T @ P @ B) + (R + B.T @ P @ B).T)
+    self.Kfb = np.linalg.solve(self.S, B.T @ P @ A)
+    self.Acl = A - B @ self.Kfb
+
+    M = C.T @ Qy
+    preview_gains = []
+    AclT_power = np.eye(nx, dtype=float)
+    for _ in range(self.N):
+      gain = np.linalg.solve(self.S, B.T @ (AclT_power @ M))
+      preview_gains.append(gain)
+      AclT_power = self.Acl.T @ AclT_power
+    self.Kff = preview_gains
+
+  def step(self, x0: np.ndarray, yref_seq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = assert_shape("x0", np.asarray(x0, dtype=float).reshape(self.nx,), (self.nx,))
+    yref_seq = check_finite("yref_seq", yref_seq)
+    if yref_seq.shape != (self.N, self.ny):
+      raise ValueError(f"yref_seq must be (N,ny)=({self.N},{self.ny}), got {yref_seq.shape}")
+
+    future_refs = np.vstack((yref_seq[1:], yref_seq[-1:]))
+    u_ff = np.zeros((self.nu,), dtype=float)
+    for i, gain in enumerate(self.Kff):
+      u_ff += gain @ future_refs[i]
+    u0 = -self.Kfb @ x + u_ff
+    x1 = self.A @ x + self.B @ u0
+    return u0, x1

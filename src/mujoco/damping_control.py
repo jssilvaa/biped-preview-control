@@ -27,10 +27,14 @@ class ComplianceState:
   Stored as (6,) in world coords for translation and rotation vector for orientation. 
   """
   dr: np.ndarray  # (6,)
+  drdot: np.ndarray  # (6,)
 
   @staticmethod
   def zero() -> ComplianceState: 
-    return ComplianceState(dr=np.zeros(6, dtype=float))
+    return ComplianceState(
+      dr=np.zeros(6, dtype=float),
+      drdot=np.zeros(6, dtype=float),
+    )
   
 
 def damping_step( 
@@ -66,4 +70,4 @@ def damping_step(
   dr_next[0:3] = dr[0:3] + dt * drdot[0:3]
   dr_next[3:6] = compose_rotvec(dt * drdot[3:6], dr[3:6])
 
-  return ComplianceState(dr=dr_next)
+  return ComplianceState(dr=dr_next, drdot=drdot.copy())

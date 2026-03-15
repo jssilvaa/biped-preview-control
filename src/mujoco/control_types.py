@@ -39,6 +39,8 @@ class CentroidalDesired:
   com_vel: np.ndarray       # (3,)
   base_R_world: np.ndarray | None 
   base_omega_world: np.ndarray | None 
+  com_acc: np.ndarray | None = None   # (3,)
+  base_alpha_world: np.ndarray | None = None
 
 
 @dataclass
