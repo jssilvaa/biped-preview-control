@@ -15,6 +15,19 @@ class PatchGeomMap:
   patch_geom_ids: list[set[int]]  # size like ContactModel.patches 
 
 
+@dataclass
+class ContactMeasurementDiagnostics:
+  floor_contacts_considered: int = 0
+  assigned_contacts: int = 0
+  unassigned_robot_contacts: int = 0
+  filtered_small_normal_contacts: int = 0
+  unassigned_robot_geom_ids: set[int] | None = None
+
+  def __post_init__(self) -> None:
+    if self.unassigned_robot_geom_ids is None:
+      self.unassigned_robot_geom_ids = set()
+
+
 def build_patch_geom_map_from_sites(model: mujoco.MjModel, site_ids: list[int]) -> PatchGeomMap: 
   """
   Each patch is anchored to a site. 
@@ -46,7 +59,8 @@ def measure_patch_wrenches_world(
     floor_geom_id: int, 
     contact_model: ContactModel, 
     geom_map: PatchGeomMap, 
-    min_normal_force: float = 0.0 
+    min_normal_force: float = 0.0,
+    diagnostics: ContactMeasurementDiagnostics | None = None,
 ) -> list[np.ndarray]: 
   """
   Returns a list of wrenches per patch, each wrench (6,) in world frame: 
@@ -71,6 +85,9 @@ def measure_patch_wrenches_world(
     if (g1 != int(floor_geom_id)) and (g2 != int(floor_geom_id)): 
       continue 
 
+    if diagnostics is not None:
+      diagnostics.floor_contacts_considered += 1
+
     robot_gid = g2 if g1 == int(floor_geom_id) else g1 
 
     if int(model.geom_bodyid[robot_gid]) == 0: # world body
@@ -90,6 +107,8 @@ def measure_patch_wrenches_world(
 
     fn = float(np.dot(f_w, n_w))
     if fn < float(min_normal_force): 
+      if diagnostics is not None:
+        diagnostics.filtered_small_normal_contacts += 1
       continue 
 
     p_contact = np.asarray(c.pos, dtype=float).reshape(3,).copy()
@@ -101,12 +120,15 @@ def measure_patch_wrenches_world(
         p0 = patch_origin[i]
         w_patch[i][:3] += f_w
         w_patch[i][3:] += tau_w_at_contact + np.cross(p_contact - p0, f_w)
-        assigned = True 
+        assigned = True
+        if diagnostics is not None:
+          diagnostics.assigned_contacts += 1
         break 
 
-    # if no patch mathes, drop the contact 
+    # If no patch matches, drop the contact but count it deterministically.
     if not assigned: 
-      print(f"{robot_gid} not assigned to any known robot patch in {geom_map.__repr__}")
-      raise RuntimeError("Robot fell!") # if robot falls in Phase A (i.e. no contact switching yet) stop exec
+      if diagnostics is not None:
+        diagnostics.unassigned_robot_contacts += 1
+        diagnostics.unassigned_robot_geom_ids.add(int(robot_gid))
 
   return w_patch 

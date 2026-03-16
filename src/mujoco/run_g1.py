@@ -456,7 +456,8 @@ def _main():
         motion_amp=.05,
         motion_freq_hz=0.5,
         preview_state_source="desired_delay",  # paper Fig.1: preview receives r^d_{-Δt} (one-step-ahead desired, model-derived), NOT measurement
-        preview_blend_alpha=0.05,              # unused with desired_delay; kept for reference
+        preview_blend_alpha=0.0,               # 0 = disabled; blend causes systematic amplitude attenuation
+        preview_max_drift=0.02,                # [m] hard clamp: zero attenuation when drift < 20mm; safety net for transients
         reference_advance_steps=0,             # no advance; desired_delay carries its own 1-step-ahead offset
         floor_geom_name=FLOOR_GEOM_NAME,
         site_names=SITE_NAMES,

@@ -69,6 +69,7 @@ class MurookaReferenceCommand:
 class StackControllerConfig: 
   enable_preview_planner: bool = True 
   enable_wrench_projection: bool = True 
+  enable_centroidal_stabilizer: bool = True
   enable_wrench_distribution: bool = True 
 
   base_body_id: int | None = None 
@@ -80,8 +81,17 @@ class StackControllerConfig:
   sim_dt: float = 1e-3 
   preview_dt: float = 1e-3
   preview_horizon_steps: int = 400 
+  preview_controller_mode: Literal["lqt", "lqt_normalized"] = "lqt"
+  preview_linear_position_scale: float = 0.05
+  preview_angular_position_scale: float = 0.10
+  preview_nominal_freq_hz: float = 0.5
   preview_state_source: Literal["desired_delay", "measured", "open_loop", "blended"] = "measured"
   preview_blend_alpha: float = 0.05
+  preview_max_drift: float = 0.02  # [m] hard clamp for desired_delay; 0 = use blend instead
+  preview_q_pos_override: float | None = None
+  preview_q_wrench_override: float | None = None
+  preview_r_jerk_override: float | None = None
+  preview_ki_pos_override: float | None = None
 
   stabilizer_gains: StabilizerGains = StabilizerGains.diagonal()
 
@@ -118,6 +128,7 @@ class StackMurookaOutputs:
 
   preview_state: CentroidalReference
   desired_state: CentroidalDesired 
+  desired_from_bar_wd: CentroidalDesired | None
   measured_state: CentroidalMeasured 
 
   # diagnostic fields
@@ -158,17 +169,36 @@ class StackController:
     
     self.preview = None 
     if cfg.enable_preview_planner:
-      lin_cfg = PreviewConfig.build_linear(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps) 
-      ang_cfg = PreviewConfig.build_angular(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps) 
+      if cfg.preview_controller_mode == "lqt":
+        lin_cfg = PreviewConfig.build_linear(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps)
+        ang_cfg = PreviewConfig.build_angular(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps)
+      elif cfg.preview_controller_mode == "lqt_normalized":
+        lin_cfg = PreviewConfig.build_linear_normalized(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps)
+        ang_cfg = PreviewConfig.build_angular_normalized(dt=cfg.preview_dt, horizon_steps=cfg.preview_horizon_steps)
+      else:
+        raise ValueError(f"Unsupported preview_controller_mode: {cfg.preview_controller_mode}")
+      if cfg.preview_q_pos_override is not None:
+        lin_cfg.q_pos = float(cfg.preview_q_pos_override)
+      if cfg.preview_q_wrench_override is not None:
+        lin_cfg.q_wrench = float(cfg.preview_q_wrench_override)
+      if cfg.preview_r_jerk_override is not None:
+        lin_cfg.r_jerk = float(cfg.preview_r_jerk_override)
+      if cfg.preview_ki_pos_override is not None:
+        lin_cfg.ki_pos = float(cfg.preview_ki_pos_override)
       self.preview = CentroidalPreviewPlanner(
         mass=self.mass, 
         I_diag=self.I_diag,
         lin_cfg=lin_cfg,
         ang_cfg=ang_cfg,
+        controller_mode=cfg.preview_controller_mode,
+        linear_position_scale=float(cfg.preview_linear_position_scale),
+        angular_position_scale=float(cfg.preview_angular_position_scale),
+        nominal_freq_hz=float(cfg.preview_nominal_freq_hz),
       )
 
       self._preview_inited = False
       self._delayed_preview_state: DelayedPreviewState | None = None
+      self._last_measured_preview_state: DelayedPreviewState | None = None
       self._preview_elapsed_since_update = 0.0
       self._held_preview_ref: CentroidalReference | None = None
       self._held_bar_wp: ResultantWrenchBar | None = None
@@ -209,6 +239,63 @@ class StackController:
       alpha0=delayed.alpha_world,
     )
     return True
+
+  @staticmethod
+  def _copy_measured_preview_state(
+    measured: CentroidalMeasured,
+    *,
+    com_acc: np.ndarray,
+    alpha_world: np.ndarray | None,
+  ) -> DelayedPreviewState:
+    phi_world = None
+    omega_world = None
+    if measured.base is not None:
+      phi_world = None if measured.base.phi_world is None else np.asarray(measured.base.phi_world, dtype=float).reshape(3,).copy()
+      omega_world = None if measured.base.omega_world is None else np.asarray(measured.base.omega_world, dtype=float).reshape(3,).copy()
+    alpha_copy = None if alpha_world is None else np.asarray(alpha_world, dtype=float).reshape(3,).copy()
+    return DelayedPreviewState(
+      com=np.asarray(measured.com, dtype=float).reshape(3,).copy(),
+      com_vel=np.asarray(measured.com_vel, dtype=float).reshape(3,).copy(),
+      com_acc=np.asarray(com_acc, dtype=float).reshape(3,).copy(),
+      phi_world=phi_world,
+      omega_world=omega_world,
+      alpha_world=alpha_copy,
+    )
+
+  def _sync_preview_from_measured(self, measured: CentroidalMeasured) -> None:
+    if self.preview is None:
+      raise RuntimeError("Preview planner is not initialized")
+
+    dt_sync = float(max(self.cfg.preview_dt, self.cfg.sim_dt))
+    if self._last_measured_preview_state is None:
+      com_acc = np.zeros(3, dtype=float)
+      alpha_world = None if measured.base is None else np.zeros(3, dtype=float)
+    else:
+      prev = self._last_measured_preview_state
+      com_acc = (
+        np.asarray(measured.com_vel, dtype=float).reshape(3,)
+        - np.asarray(prev.com_vel, dtype=float).reshape(3,)
+      ) / dt_sync
+      if measured.base is not None and measured.base.omega_world is not None and prev.omega_world is not None:
+        alpha_world = (
+          np.asarray(measured.base.omega_world, dtype=float).reshape(3,)
+          - np.asarray(prev.omega_world, dtype=float).reshape(3,)
+        ) / dt_sync
+      else:
+        alpha_world = None if measured.base is None else np.zeros(3, dtype=float)
+
+    self.preview.update_from_meas(
+      measured.com,
+      measured.com_vel,
+      measured.base,
+      coma0=com_acc,
+      alpha0=alpha_world,
+    )
+    self._last_measured_preview_state = self._copy_measured_preview_state(
+      measured,
+      com_acc=com_acc,
+      alpha_world=alpha_world,
+    )
 
   def _preview_update_due(self) -> bool:
     if not self._preview_inited:
@@ -322,15 +409,19 @@ class StackController:
       self.preview.reset(com0=com, comv0=com_vel, phi0=phi0, omega0=omega0)
     if just_initialized or self._preview_update_due():
       if self.cfg.preview_state_source == "measured":
-        self.preview.update_from_meas(com, com_vel, base)
+        self._sync_preview_from_measured(measured)
       elif self.cfg.preview_state_source == "desired_delay":
         synced = self._sync_preview_from_desired_delay()
         if not synced:
-          self.preview.update_from_meas(com, com_vel, base)
-        # Position-only leash: bounds preview vs actual CoM to ~0.25mm (tau=100ms, alpha=0.05).
-        # Velocity is intentionally NOT blended — model-derived v is the correct LQT feedforward input.
-        # Blending velocity would re-introduce the attenuation seen in "measured" / "blended" modes.
-        if self.cfg.preview_blend_alpha > 0.0:
+          self._sync_preview_from_measured(measured)
+        # Safety leash: prevent preview from diverging too far from robot.
+        # Hard clamp (max_drift > 0): zero attenuation when drift < threshold, only
+        #   clips during transients.  Natural drift at 0.5Hz/50mm ≈ 13mm.
+        # Blend (max_drift == 0, blend_alpha > 0): systematic amplitude attenuation
+        #   proportional to alpha*(1-tracking_ratio); ~15% at alpha=0.05.
+        if self.cfg.preview_max_drift > 0.0:
+          self.preview.clamp_position_drift(self.cfg.preview_max_drift, com, base)
+        elif self.cfg.preview_blend_alpha > 0.0:
           self.preview.blend_position_only(self.cfg.preview_blend_alpha, com, base)
       elif self.cfg.preview_state_source == "open_loop":
         pass  # LQT evolves from its own predicted state; no measurement sync
@@ -403,12 +494,36 @@ class StackController:
     )
 
 
-    # 4/5. Stabilizer --> bar_wd 
-    bar_wd, dbg_stab = stabilize_bar_wrench(
-      bar_wp_proj=bar_wp_proj, 
-      desired=desired,
-      measured=measured,
-      gains=self.cfg.stabilizer_gains,
+    # 4/5. Stabilizer --> bar_wd
+    if self.cfg.enable_centroidal_stabilizer:
+      bar_wd, dbg_stab = stabilize_bar_wrench(
+        bar_wp_proj=bar_wp_proj, 
+        desired=desired,
+        measured=measured,
+        gains=self.cfg.stabilizer_gains,
+      )
+    else:
+      bar_wd = ResultantWrenchBar(
+        bar_force_world=np.asarray(bar_wp_proj.bar_force_world, dtype=float).reshape(3,).copy(),
+        bar_moment_world=np.asarray(bar_wp_proj.bar_moment_world, dtype=float).reshape(3,).copy(),
+      )
+      dbg_stab = {
+        "status": "disabled",
+        "delta_bar_force": np.zeros(3, dtype=float),
+        "delta_bar_moment": np.zeros(3, dtype=float),
+        "bar_wp_proj": np.hstack((bar_wp_proj.bar_force_world, bar_wp_proj.bar_moment_world)),
+        "bar_wd": np.hstack((bar_wd.bar_force_world, bar_wd.bar_moment_world)),
+      }
+
+    desired_from_bar_wd = predict_one_step(
+      dt=float(self.cfg.sim_dt),
+      mass=self.mass,
+      I_diag=self.I_diag,
+      com=ref.com_ref,
+      com_vel=ref.com_vel_ref,
+      base_R=(Exp(phi_p)) if base is not None else None,
+      base_omega=omega_p,
+      bar_wp_proj=bar_wd,
     )
 
 
@@ -457,6 +572,8 @@ class StackController:
       "distribution": dbg_dist, 
       "preview_state_source": self.cfg.preview_state_source,
       "preview_updated": preview_updated,
+      "projection_resultant_err_norm": float(np.linalg.norm(np.asarray(dbg_proj["w_proj"], dtype=float).reshape(6,) - np.asarray(dbg_proj["w_p"], dtype=float).reshape(6,))) if "w_proj" in dbg_proj and "w_p" in dbg_proj else np.nan,
+      "distribution_resultant_err_norm": w_err_norm if w_err_norm is not None else np.nan,
     }
 
     self._delayed_preview_state = self._copy_preview_delay_state(
@@ -475,6 +592,7 @@ class StackController:
       patch_wrenches_world=patch_wrenches_world,
       preview_state=ref,
       desired_state=desired,
+      desired_from_bar_wd=desired_from_bar_wd,
       measured_state=measured,
       w_real_world_origin=w_real_world_origin,
       w_err_norm=w_err_norm,

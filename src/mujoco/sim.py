@@ -13,6 +13,7 @@ from viz import Viz
 from dynamics import compute_com_state, compute_base_state
 from contact_patches import PatchSpec
 from contact_measurement import (
+    ContactMeasurementDiagnostics,
     build_patch_geom_map_from_sites,
     measure_patch_wrenches_world,
 )
@@ -35,7 +36,7 @@ from contact_phase import (
 
 from whole_body_ik import IKConfig, SiteTarget, solve_ik
 from joint_servo import JointServoConfig, compute_motor_ctrl_from_qpos_target, compute_position_ctrl_from_qpos_target
-from lie_math import Exp
+from lie_math import Exp, logvec
 
 
 @dataclass(frozen=True)
@@ -56,8 +57,17 @@ class MurookaSimConfig:
   I_diag: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0], dtype=float))
   preview_dt: float = 5e-3 # match dt above
   preview_horizon_steps: int = 400 
+  preview_controller_mode: str = "lqt"
+  preview_linear_position_scale: float = 0.05
+  preview_angular_position_scale: float = 0.10
+  preview_nominal_freq_hz: float = 0.5
   preview_state_source: str = "measured"
   preview_blend_alpha: float = 0.05
+  preview_max_drift: float = 0.02  # [m] hard clamp for desired_delay mode; 0 = use blend_alpha instead
+  preview_q_pos_override: float | None = None
+  preview_q_wrench_override: float | None = None
+  preview_r_jerk_override: float | None = None
+  preview_ki_pos_override: float | None = None
 
   # preview references 
   enable_motion_refs: bool = True 
@@ -77,6 +87,8 @@ class MurookaSimConfig:
   phase_gains: PhaseGains = PhaseGains.murooka_table_ii()
   fn_on: float = 30.0 
   fn_off: float = 10.0 
+  enable_centroidal_stabilizer: bool = True
+  enable_damping_control: bool = True
 
   # IK 
   ik_cfg: IKConfig = IKConfig(base_body_id=base_body_id)
@@ -87,6 +99,42 @@ class MurookaSimConfig:
   # viz 
   viz: bool = False 
   display_every: int = 2 
+
+
+def _ik_task_residual_norm(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    qpos_eval: np.ndarray,
+    com_target: np.ndarray,
+    site_targets: list[SiteTarget],
+    base_body_id: int | None,
+    base_R_target: np.ndarray | None,
+) -> float:
+  qpos0 = data.qpos.copy()
+  try:
+    data.qpos[:] = np.asarray(qpos_eval, dtype=float).reshape(model.nq,)
+    mujoco.mj_forward(model, data)
+
+    residuals: list[float] = []
+    com_eval, _ = compute_com_state(model, data)
+    residuals.append(float(np.linalg.norm(np.asarray(com_target, dtype=float).reshape(3,) - com_eval)))
+
+    for st in site_targets:
+      sid = int(st.site_id)
+      p = np.asarray(data.site_xpos[sid], dtype=float).reshape(3,)
+      R = np.asarray(data.site_xmat[sid], dtype=float).reshape(3, 3)
+      residuals.append(float(np.linalg.norm(np.asarray(st.p_world, dtype=float).reshape(3,) - p)))
+      residuals.append(float(np.linalg.norm(logvec(np.asarray(st.R_world, dtype=float).reshape(3, 3) @ R.T))))
+
+    if base_body_id is not None and base_R_target is not None:
+      R_base = np.asarray(data.xmat[int(base_body_id)], dtype=float).reshape(3, 3)
+      residuals.append(float(np.linalg.norm(logvec(np.asarray(base_R_target, dtype=float).reshape(3, 3) @ R_base.T))))
+
+    return float(np.linalg.norm(np.asarray(residuals, dtype=float))) if residuals else 0.0
+  finally:
+    data.qpos[:] = qpos0
+    mujoco.mj_forward(model, data)
 
 
 def run_simulation( 
@@ -148,6 +196,7 @@ def run_simulation(
     cfg=StackControllerConfig(
       enable_preview_planner=True,
       enable_wrench_projection=True,
+      enable_centroidal_stabilizer=bool(cfg.enable_centroidal_stabilizer),
       enable_wrench_distribution=True,
       base_body_id=cfg.base_body_id,
       I_diag=np.asarray(cfg.I_diag, dtype=float).reshape(3,),
@@ -155,8 +204,17 @@ def run_simulation(
       sim_dt=float(cfg.dt),
       preview_dt=float(cfg.preview_dt),
       preview_horizon_steps=int(cfg.preview_horizon_steps),
+      preview_controller_mode=str(cfg.preview_controller_mode),
+      preview_linear_position_scale=float(cfg.preview_linear_position_scale),
+      preview_angular_position_scale=float(cfg.preview_angular_position_scale),
+      preview_nominal_freq_hz=float(cfg.preview_nominal_freq_hz),
       preview_state_source=cfg.preview_state_source,
       preview_blend_alpha=float(cfg.preview_blend_alpha),
+      preview_max_drift=float(cfg.preview_max_drift),
+      preview_q_pos_override=cfg.preview_q_pos_override,
+      preview_q_wrench_override=cfg.preview_q_wrench_override,
+      preview_r_jerk_override=cfg.preview_r_jerk_override,
+      preview_ki_pos_override=cfg.preview_ki_pos_override,
       stabilizer_gains=_stab_gains,
       reg_projection=float(cfg.reg_projection),
       reg_distribution=float(cfg.reg_distribution),
@@ -198,6 +256,12 @@ def run_simulation(
   w_des_log = np.zeros((cfg.N, nc, 6), dtype=float)
   w_meas_log = np.zeros((cfg.N, nc, 6), dtype=float)
   dr_log = np.zeros((cfg.N, nc, 6), dtype=float)
+  compliance_norm_log = np.zeros((cfg.N, nc, 2), dtype=float)
+  ik_residual_norm_log = np.zeros(cfg.N, dtype=float)
+  unassigned_patch_contact_count_log = np.zeros(cfg.N, dtype=int)
+  site_target_pos_log = np.zeros((cfg.N, nc, 3), dtype=float)
+  site_target_rotvec_log = np.zeros((cfg.N, nc, 3), dtype=float)
+  base_target_rotvec_log = np.zeros((cfg.N, 3), dtype=float)
 
   # Per block logs: 
   # Includes: 
@@ -206,9 +270,11 @@ def run_simulation(
   bar_wp_log = np.zeros((cfg.N, 6), dtype=float)
   bar_wp_proj_log = np.zeros((cfg.N, 6), dtype=float)
   bar_wd_log = np.zeros((cfg.N, 6), dtype=float)
+  com_des_from_bar_wd_log = np.zeros((cfg.N, 3), dtype=float)
   bar_f_ref_cmd_log = np.zeros((cfg.N, 3), dtype=float)
   bar_n_ref_cmd_log = np.zeros((cfg.N, 3), dtype=float)
-
+  projection_resultant_err_norm_log = np.full(cfg.N, np.nan, dtype=float)
+  
   
   w_cmd_log = np.zeros((cfg.N, 6), dtype=float)
   w_real_log = np.full((cfg.N, 6), np.nan, dtype=float)
@@ -334,10 +400,12 @@ def run_simulation(
          floor_geom_id=floor_gid, 
          contact_model=out.contact_model, 
          geom_map=geom_map,
-         min_normal_force=0.0,
+          min_normal_force=0.0,
+         diagnostics=(meas_diag := ContactMeasurementDiagnostics()),
       )
       if len(w_meas) != nc: 
          raise RuntimeError(f"w_meas length mismatch. expected {nc}, got {len(w_meas)} instead.")
+      unassigned_patch_contact_count_log[k] = int(meas_diag.unassigned_robot_contacts)
 
       w_des = out.patch_wrenches_world
       if len(w_des) != nc: 
@@ -356,14 +424,18 @@ def run_simulation(
       # patch_active = hyst.update(fn)
 
       # Damping Control Update --> compliance dr 
-      for i in range(nc): 
-        comp[i] = damping_step(
-          dt=float(cfg.dt), 
-          gains=gains_per_patch[i], 
-          state=comp[i],
-          w_meas=np.asarray(w_meas[i], dtype=float).reshape(6,),
-          w_des=np.asarray(w_des[i], dtype=float).reshape(6,),
-        )
+      if cfg.enable_damping_control:
+        for i in range(nc): 
+          comp[i] = damping_step(
+            dt=float(cfg.dt), 
+            gains=gains_per_patch[i], 
+            state=comp[i],
+            w_meas=np.asarray(w_meas[i], dtype=float).reshape(6,),
+            w_des=np.asarray(w_des[i], dtype=float).reshape(6,),
+          )
+      else:
+        for i in range(nc):
+          comp[i] = ComplianceState.zero()
 
       # IK Targets: stance Pose + compliance offsets 
       site_targets: list[SiteTarget] = []
@@ -377,9 +449,11 @@ def run_simulation(
       # CoM target 
       com_t = np.asarray(out.desired_state.com, dtype=float).reshape(3,)
       com_des_log[k] = com_t 
+      com_des_from_bar_wd_log[k] = np.asarray(out.desired_from_bar_wd.com, dtype=float).reshape(3,)
 
       # Base R target 
       base_R_t = np.asarray(out.desired_state.base_R_world, dtype=float).reshape(3,3)
+      base_target_rotvec_log[k] = logvec(base_R_t)
 
       qpos_des = solve_ik(
         model, data,
@@ -387,6 +461,15 @@ def run_simulation(
         site_targets=site_targets,
         qpos_nominal=qpos_nominal,
         cfg=cfg.ik_cfg,
+        base_R_target=base_R_t,
+      )
+      ik_residual_norm_log[k] = _ik_task_residual_norm(
+        model,
+        data,
+        qpos_eval=qpos_des,
+        com_target=com_t,
+        site_targets=site_targets,
+        base_body_id=cfg.base_body_id,
         base_R_target=base_R_t,
       )
 
@@ -401,31 +484,52 @@ def run_simulation(
         w_des_log[k, i] = np.asarray(w_des[i], dtype=float).reshape(6,)
         w_meas_log[k, i] = np.asarray(w_meas[i], dtype=float).reshape(6,)
         dr_log[k, i] = comp[i].dr.copy()
+        compliance_norm_log[k, i, 0] = float(np.linalg.norm(comp[i].dr[:3]))
+        compliance_norm_log[k, i, 1] = float(np.linalg.norm(comp[i].dr[3:]))
+        site_target_pos_log[k, i] = np.asarray(site_targets[i].p_world, dtype=float).reshape(3,)
+        site_target_rotvec_log[k, i] = logvec(np.asarray(site_targets[i].R_world, dtype=float).reshape(3, 3))
+      projection_resultant_err_norm_log[k] = float(out.debug.get("projection_resultant_err_norm", np.nan))
       
       if viewer is not None and (k % int(cfg.display_every) == 0): 
         viewer.update(data)
 
     return dict(
       q_log=q_log, 
+      ref_log=com_ref_cmd_log,
+      preview_log=com_preview_log,
+      desired_log=com_des_log,
+      desired_from_bar_wd_log=com_des_from_bar_wd_log,
+      measured_log=com_meas_log,
       com_meas_log=com_meas_log,
       com_preview_log=com_preview_log,
       com_des_log=com_des_log, 
+      com_des_from_bar_wd_log=com_des_from_bar_wd_log,
       com_ref_cmd_log=com_ref_cmd_log,
       patch_active_log=patch_active_log,
       fn_log=fn_log, 
       w_des_log=w_des_log, 
       w_meas_log=w_meas_log,
       dr_log=dr_log,
+      compliance_norm_log=compliance_norm_log,
+      ik_residual_norm_log=ik_residual_norm_log,
+      unassigned_patch_contact_count_log=unassigned_patch_contact_count_log,
+      site_target_pos_log=site_target_pos_log,
+      site_target_rotvec_log=site_target_rotvec_log,
+      base_target_rotvec_log=base_target_rotvec_log,
       bar_wp_log=bar_wp_log, 
       bar_wp_proj_log=bar_wp_proj_log,
       bar_wd_log=bar_wd_log,
       bar_f_ref_cmd_log=bar_f_ref_cmd_log,
       bar_n_ref_cmd_log=bar_n_ref_cmd_log,
+      projection_resultant_err_norm_log=projection_resultant_err_norm_log,
       w_cmd_log=w_cmd_log,
       w_real_log=w_real_log,
       w_err_norm_log=w_err_norm_log,
+      w_exec_err_norm_log=w_err_norm_log,
       w_force_err_norm_log=w_force_err_norm_log,
+      w_exec_force_err_norm_log=w_force_err_norm_log,
       w_moment_err_norm_log=w_moment_err_norm_log,
+      w_exec_moment_err_norm_log=w_moment_err_norm_log,
     )
   
   finally: 

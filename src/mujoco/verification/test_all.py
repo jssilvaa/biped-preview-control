@@ -310,7 +310,7 @@ class TestPreviewCentroidal:
         ang_cfg = PreviewConfig.build_angular(dt=dt, horizon_steps=N)
         return lin_cfg, ang_cfg
 
-    def _make_planner(self, dt=0.005, N=400):
+    def _make_planner(self, dt=0.005, N=400, controller_mode: str = "lqt"):
         from preview_centroidal import CentroidalPreviewPlanner
         lin_cfg, ang_cfg = self._make_cfgs(dt=dt, N=N)
         return CentroidalPreviewPlanner(
@@ -318,6 +318,7 @@ class TestPreviewCentroidal:
             I_diag=np.array([1.0, 1.0, 0.5]),
             lin_cfg=lin_cfg,
             ang_cfg=ang_cfg,
+            controller_mode=controller_mode,
         )
 
     def test_reset_then_constant_ref_converges(self):
@@ -406,6 +407,69 @@ class TestPreviewCentroidal:
         acc1 = np.asarray(ref1.meta["phi_acc"])
         acc2 = np.asarray(ref2.meta["phi_acc"])
         assert np.all(np.isfinite(acc1)) and np.all(np.isfinite(acc2))
+
+    def test_update_from_meas_accepts_full_kinematic_state(self):
+        """
+        Measured-state synchronization must be able to overwrite the preview's
+        full kinematic state, not just position/velocity.
+        """
+        from control_types import BaseState
+
+        planner = self._make_planner()
+        planner.reset(
+            com0=np.array([0.0, 0.0, 1.0]),
+            comv0=np.zeros(3),
+            phi0=np.zeros(3),
+            omega0=np.zeros(3),
+        )
+
+        com = np.array([0.1, -0.2, 0.9])
+        com_vel = np.array([0.3, -0.4, 0.5])
+        com_acc = np.array([0.6, -0.7, 0.8])
+        phi = np.array([0.01, -0.02, 0.03])
+        omega = np.array([0.04, -0.05, 0.06])
+        alpha = np.array([0.07, -0.08, 0.09])
+
+        planner.update_from_meas(
+            com,
+            com_vel,
+            BaseState(R_world=np.eye(3), omega_world=omega, phi_world=phi),
+            coma0=com_acc,
+            alpha0=alpha,
+        )
+
+        for i in range(3):
+            assert np.allclose(planner.lin[i].x, np.array([com[i], com_vel[i], com_acc[i]]), atol=1e-12)
+            assert np.allclose(planner.ang[i].x, np.array([phi[i], omega[i], alpha[i]]), atol=1e-12)
+
+    def test_normalized_planner_zero_reference_zero_output(self):
+        planner = self._make_planner(controller_mode="lqt_normalized")
+        com0 = np.zeros(3)
+        planner.reset(com0=com0, comv0=np.zeros(3))
+        ref, bar_wp = planner.step_constant(
+            com_ref=com0,
+            bar_f_ref=np.zeros(3),
+            phi_ref=np.zeros(3),
+            bar_n_ref=np.zeros(3),
+        )
+        assert np.allclose(ref.com_ref, com0, atol=1e-12)
+        assert np.allclose(ref.com_vel_ref, np.zeros(3), atol=1e-12)
+        assert np.allclose(ref.com_acc_ref, np.zeros(3), atol=1e-12)
+        assert np.allclose(bar_wp.bar_force_world, np.zeros(3), atol=1e-12)
+
+    def test_normalized_planner_positive_step_moves_positive(self):
+        planner = self._make_planner(controller_mode="lqt_normalized")
+        planner.reset(com0=np.zeros(3), comv0=np.zeros(3))
+        ref, bar_wp = planner.step_constant(
+            com_ref=np.array([0.05, 0.0, 0.0]),
+            bar_f_ref=np.zeros(3),
+            phi_ref=np.zeros(3),
+            bar_n_ref=np.zeros(3),
+        )
+        assert ref.com_ref[0] > 0.0
+        assert ref.com_vel_ref[0] > 0.0
+        assert ref.com_acc_ref[0] > 0.0
+        assert bar_wp.bar_force_world[0] > 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1213,6 +1277,26 @@ class TestContactMeasurement:
     </mujoco>
     """
 
+    CONTACT_WITH_UNASSIGNED_XML = """
+    <mujoco>
+      <option gravity="0 0 -9.81" timestep="0.002" integrator="Euler"/>
+      <worldbody>
+        <geom name="floor" type="plane" size="1 1 0.1" pos="0 0 0"/>
+
+        <body name="foot1" pos="0 0 0.20">
+          <joint name="z1" type="slide" axis="0 0 1"/>
+          <geom name="foot1_geom" type="sphere" size="0.05" mass="1.0"/>
+          <site name="foot1_site" pos="0 0 0"/>
+        </body>
+
+        <body name="rogue" pos="0.15 0 0.20">
+          <joint name="z2" type="slide" axis="0 0 1"/>
+          <geom name="rogue_geom" type="sphere" size="0.05" mass="1.0"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+
     NO_CONTACT_XML = """
     <mujoco>
       <option gravity="0 0 0" timestep="0.002" integrator="Euler"/>
@@ -1436,6 +1520,44 @@ class TestContactMeasurement:
         assert len(w_meas) == len(w_manual)
         for wm, wo in zip(w_meas, w_manual):
             assert np.allclose(wm, wo, atol=1e-10), f"measurement={wm}, manual={wo}"
+
+    def test_unassigned_robot_contacts_are_counted_and_dropped(self):
+        """
+        Robot contacts outside the tracked patch map must be ignored deterministically
+        and surfaced through diagnostics instead of raising.
+        """
+        from contact_measurement import (
+            ContactMeasurementDiagnostics,
+            build_patch_geom_map_from_sites,
+            measure_patch_wrenches_world,
+        )
+
+        m = mujoco.MjModel.from_xml_string(self.CONTACT_WITH_UNASSIGNED_XML)
+        d = mujoco.MjData(m)
+        self._settle(m, d)
+
+        sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "foot1_site")
+        floor_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        rogue_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "rogue_geom")
+
+        cmodel = self._build_contact_model(m, d, ["foot1_site"])
+        geom_map = build_patch_geom_map_from_sites(m, [int(sid)])
+        diagnostics = ContactMeasurementDiagnostics()
+
+        w = measure_patch_wrenches_world(
+            m, d,
+            floor_geom_id=int(floor_gid),
+            contact_model=cmodel,
+            geom_map=geom_map,
+            min_normal_force=0.0,
+            diagnostics=diagnostics,
+        )
+
+        assert len(w) == 1
+        assert w[0][2] > 0.0, f"Tracked patch should still report positive normal force, got {w[0]}"
+        assert diagnostics.assigned_contacts > 0
+        assert diagnostics.unassigned_robot_contacts > 0
+        assert int(rogue_gid) in diagnostics.unassigned_robot_geom_ids
 
 # Run
 if __name__ == "__main__":
