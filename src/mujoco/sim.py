@@ -18,6 +18,7 @@ from contact_measurement import (
 )
 
 from reference_sequences import sine_com_bar_ref_seq, sine_com_ref_seq, zeros_bar_seq
+from centroidal_stabilizer import StabilizerGains
 from stack_controller import (
     StackController,
     StackControllerConfig,
@@ -119,20 +120,44 @@ def run_simulation(
       raise ValueError(f"site_vertex_offsets[{name}] must be finite (Nv,3), got {offs.shape}")
     patch_specs.append(PatchSpec(name=name, site_id=int(sid), vertex_offsets_site=offs))
   
+  # Stabilizer gains from Murooka Appendix-A Eq. (19) — DCM correspondence:
+  #   K_PL = m * omega^2 * K_xi
+  #   K_DL = m * omega  * K_xi        =>  zeta = 0.5 analytically; numerically ~0.707 for K_xi=2
+  #   where omega = sqrt(g / z_c) is the LIPM natural frequency.
+  #
+  # K_xi=2 matches the paper's Table III for HRP-5P (m=105, omega=3.21 => KP=2163, KD=674).
+  # Scaling by G1 mass instead of transplanting the absolute gains avoids CWC saturation:
+  #   G1 (m≈35, omega≈3.40): KP≈807, KD≈238, peak wrench ≈46% CWC
+  #   Paper values direct (KP=2000): peak wrench ≈102% CWC → inevitable clip → fall
+  _com0_init, _ = compute_com_state(model, data)
+  _mass_total   = float(np.sum(model.body_mass))
+  _z_c          = float(_com0_init[2])                            # standing CoM height [m]
+  _g_mag        = float(np.linalg.norm(model.opt.gravity))
+  _omega_lipm   = float(np.sqrt(_g_mag / _z_c)) if _z_c > 0.01 else 3.4
+  _K_xi         = 2.0                                             # paper's proportional gain factor
+  _kp_lin       = _mass_total * _omega_lipm**2 * _K_xi            # K_PL = m * omega^2 * K_xi
+  _kd_lin       = _mass_total * _omega_lipm    * _K_xi            # K_DL = m * omega   * K_xi
+  _stab_gains = StabilizerGains.diagonal(
+    kp_lin=(_kp_lin, _kp_lin, _kp_lin),
+    kd_lin=(_kd_lin, _kd_lin, _kd_lin),
+  )
+
   # Build Stack Controller
   stack = StackController(
-    model=model, 
+    model=model,
     cfg=StackControllerConfig(
       enable_preview_planner=True,
-      enable_wrench_projection=True, 
+      enable_wrench_projection=True,
       enable_wrench_distribution=True,
       base_body_id=cfg.base_body_id,
       I_diag=np.asarray(cfg.I_diag, dtype=float).reshape(3,),
       mu=float(cfg.mu),
-      preview_dt=float(cfg.preview_dt), 
+      sim_dt=float(cfg.dt),
+      preview_dt=float(cfg.preview_dt),
       preview_horizon_steps=int(cfg.preview_horizon_steps),
       preview_state_source=cfg.preview_state_source,
       preview_blend_alpha=float(cfg.preview_blend_alpha),
+      stabilizer_gains=_stab_gains,
       reg_projection=float(cfg.reg_projection),
       reg_distribution=float(cfg.reg_distribution),
       w_tan_projection=float(cfg.w_tan_projection),

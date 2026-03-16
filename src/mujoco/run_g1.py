@@ -455,9 +455,9 @@ def _main():
         motion_axis=0,
         motion_amp=.05,
         motion_freq_hz=0.5,
-        preview_state_source="measured",
-        preview_blend_alpha=0.05,
-        reference_advance_steps=60,
+        preview_state_source="desired_delay",  # paper Fig.1: preview receives r^d_{-Δt} (one-step-ahead desired, model-derived), NOT measurement
+        preview_blend_alpha=0.05,              # unused with desired_delay; kept for reference
+        reference_advance_steps=0,             # no advance; desired_delay carries its own 1-step-ahead offset
         floor_geom_name=FLOOR_GEOM_NAME,
         site_names=SITE_NAMES,
         site_vertex_offsets=site_vertex_offsets,

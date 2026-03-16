@@ -327,6 +327,11 @@ class StackController:
         synced = self._sync_preview_from_desired_delay()
         if not synced:
           self.preview.update_from_meas(com, com_vel, base)
+        # Position-only leash: bounds preview vs actual CoM to ~0.25mm (tau=100ms, alpha=0.05).
+        # Velocity is intentionally NOT blended — model-derived v is the correct LQT feedforward input.
+        # Blending velocity would re-introduce the attenuation seen in "measured" / "blended" modes.
+        if self.cfg.preview_blend_alpha > 0.0:
+          self.preview.blend_position_only(self.cfg.preview_blend_alpha, com, base)
       elif self.cfg.preview_state_source == "open_loop":
         pass  # LQT evolves from its own predicted state; no measurement sync
       elif self.cfg.preview_state_source == "blended":

@@ -17,19 +17,19 @@ class PreviewConfig:
   ki_max: float = 0.01  # anti-windup clamp for integral (meters)
 
   @staticmethod
-  def build_linear(dt: float, horizon_steps: int): 
+  def build_linear(dt: float, horizon_steps: int):
     q_pos: float = 2e2
     q_wrench: float = 5e-4
-    r_jerk: float = 1e-8 
-    ki_pos: float = 2.0
+    r_jerk: float = 1e-8
+    ki_pos: float = 0.0  # DARE terminal cost eliminates finite-horizon DC offset
     return PreviewConfig(dt=dt, horizon_steps=horizon_steps, q_pos=q_pos, q_wrench=q_wrench, r_jerk=r_jerk, ki_pos=ki_pos)
-  
+
   @staticmethod
   def build_angular(dt: float, horizon_steps: int):
-     q_pos: float = 1e2 
-     q_wrench: float = 5e-3 
+     q_pos: float = 1e2
+     q_wrench: float = 5e-3
      r_jerk: float = 1e-8
-     ki_pos: float = 2.0
+     ki_pos: float = 0.0  # DARE terminal cost eliminates finite-horizon DC offset
      return PreviewConfig(dt=dt, horizon_steps=horizon_steps, q_pos=q_pos, q_wrench=q_wrench, r_jerk=r_jerk, ki_pos=ki_pos)
 
 
@@ -161,6 +161,18 @@ class CentroidalPreviewPlanner:
     phi0 = None if base0 is None else base0.phi_world
     omega0 = None if base0 is None else base0.omega_world
     self.sync_state(com0, comv0, phi0=phi0, omega0=omega0)
+
+  def blend_position_only(self, alpha: float, com0: np.ndarray, base0: BaseState | None = None):
+    """Blend only position toward measurement, preserving model-derived velocity.
+    Used in desired_delay mode: leashes preview CoM to within ~0.25mm of robot without
+    contaminating the LQT feedforward (which depends on model-derived velocity)."""
+    com0 = np.asarray(com0, dtype=float).reshape(3,)
+    for i in range(3):
+      self.lin[i].x[0] += alpha * (com0[i] - self.lin[i].x[0])
+    if base0 is not None and base0.phi_world is not None:
+      phi0 = np.asarray(base0.phi_world, dtype=float).reshape(3,)
+      for i in range(3):
+        self.ang[i].x[0] += alpha * (phi0[i] - self.ang[i].x[0])
 
   def blend_with_meas(self, alpha: float, com0: np.ndarray, comv0: np.ndarray, base0: BaseState | None = None):
     """Blend internal predicted state toward measured state: x = (1-α)*x_pred + α*x_meas."""

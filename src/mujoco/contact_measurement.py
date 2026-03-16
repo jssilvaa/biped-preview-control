@@ -107,5 +107,6 @@ def measure_patch_wrenches_world(
     # if no patch mathes, drop the contact 
     if not assigned: 
       print(f"{robot_gid} not assigned to any known robot patch in {geom_map.__repr__}")
+      raise RuntimeError("Robot fell!") # if robot falls in Phase A (i.e. no contact switching yet) stop exec
 
   return w_patch 
